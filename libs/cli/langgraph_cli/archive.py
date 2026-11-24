@@ -9,7 +9,7 @@ from contextlib import contextmanager
 import click
 import pathspec
 
-from langgraph_cli._ignore import _build_ignore_spec
+from langgraph_cli._ignore import _build_ignore_spec, _configured_env_paths
 from langgraph_cli.config import Config, _assemble_local_deps
 
 _WARN_SIZE = 50 * 1024 * 1024  # 50 MB
@@ -84,6 +84,7 @@ def create_archive(
     extra_contexts = local_deps.additional_contexts or []
 
     dirs_to_include = [context_dir] + list(extra_contexts)
+    env_paths = _configured_env_paths(config_path, config)
 
     common = context_dir
     for d in extra_contexts:
@@ -102,7 +103,7 @@ def create_archive(
                 if key in added_dirs:
                     continue
                 added_dirs.add(key)
-                ignore_spec = _build_ignore_spec(dir_path)
+                ignore_spec = _build_ignore_spec(dir_path, env_paths=env_paths)
                 _add_directory(
                     tar, dir_path, arcname_prefix=prefix, ignore_spec=ignore_spec
                 )

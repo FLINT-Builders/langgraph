@@ -15,6 +15,8 @@ import pathspec
 from langgraph_cli._ignore import (
     _build_dockerignore_negation_hints,
     _build_ignore_spec,
+    _configured_env_paths,
+    _docker_exclude_flags,
     _is_always_excluded,
 )
 from langgraph_cli.schemas import Config
@@ -875,6 +877,8 @@ def python_config_to_docker_uv_lock(
 ) -> tuple[str, dict[str, str]]:
     from langgraph_cli.config import (
         DEFAULT_NODE_VERSION,
+        DOCKERFILE_SYNTAX_LINE,
+        REQUIRE_BUILDKIT_LINES,
         _build_python_install_commands,
         _build_runtime_env_vars,
         _get_node_pm_install_cmd,
@@ -922,16 +926,23 @@ def python_config_to_docker_uv_lock(
         workspace_context_name = "uv-workspace-root"
         additional_contexts[workspace_context_name] = str(plan.project_root)
 
+    env_paths = _configured_env_paths(config_path, config)
+
     def copy_from_project_root(
         relative_path: pathlib.PurePosixPath, destination: str
     ) -> str:
+        source_path = plan.project_root / pathlib.Path(relative_path)
+        flags = (
+            f"{_docker_exclude_flags(source_path, env_paths)} "
+            if source_path.is_dir()
+            else ""
+        )
         if workspace_context_name is not None:
             source = relative_path.as_posix() or "."
-            return f"COPY --from={workspace_context_name} {source} {destination}"
+            return f"COPY --from={workspace_context_name} {flags}{source} {destination}"
 
-        source_path = plan.project_root / pathlib.Path(relative_path)
         relative_source = source_path.relative_to(config_root).as_posix()
-        return f"ADD {relative_source} {destination}"
+        return f"ADD {flags}{relative_source} {destination}"
 
     uv_export_project_dir = "/tmp/uv_export/project"
     env_vars = _build_runtime_env_vars(config)
@@ -939,11 +950,12 @@ def python_config_to_docker_uv_lock(
     image_str = docker_tag(config, base_image, api_version)
     docker_plan = DockerBuildPlan(lines=[])
 
-    if additional_contexts:
-        docker_plan.add_raw("# syntax=docker/dockerfile:1.4")
-        docker_plan.add_blank()
+    # Named contexts and `--exclude` both need a BuildKit Dockerfile frontend
+    docker_plan.add_raw(DOCKERFILE_SYNTAX_LINE)
+    docker_plan.add_blank()
 
     docker_plan.add_instruction("FROM", image_str)
+    docker_plan.extend_nonempty(list(REQUIRE_BUILDKIT_LINES))
     docker_plan.add_blank()
     docker_plan.extend_nonempty(config["dockerfile_lines"])
     if config["dockerfile_lines"]:
@@ -1008,7 +1020,9 @@ def python_config_to_docker_uv_lock(
     docker_plan.add_raw("# -- End of uv.lock dependencies install --")
     docker_plan.add_blank()
 
-    ignore_spec = _build_ignore_spec(plan.project_root, include_gitignore=False)
+    ignore_spec = _build_ignore_spec(
+        plan.project_root, include_gitignore=False, env_paths=env_paths
+    )
     for package in plan.install_order:
         package_label = package.root.relative_to(plan.project_root).as_posix() or "."
         docker_plan.add_raw(f"# -- Adding workspace package {package_label} --")

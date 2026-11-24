@@ -30,6 +30,8 @@ FORMATTED_CLEANUP_LINES = _get_pip_cleanup_lines(
 
 PATH_TO_CONFIG = pathlib.Path(__file__).parent / "test_config.json"
 
+ENV_EXCLUDE_FLAGS = "--exclude=**/.env --exclude=**/.env.* --exclude=**/*.env"
+
 
 def _write_uv_lock_workspace(
     tmpdir_path: pathlib.Path,
@@ -668,17 +670,19 @@ def test_config_to_docker_simple():
         base_image="langchain/langgraph-api",
     )
     expected_docker_stdin = f"""\
-# syntax=docker/dockerfile:1.4
+# syntax=docker/dockerfile:1.19
 FROM langchain/langgraph-api:3.11
+# BuildKit is required: the classic builder ignores ADD/COPY --exclude
+RUN --network=default true
 # -- Installing local requirements --
 COPY --from=outer-requirements.txt requirements.txt /deps/outer-graphs_reqs_a/graphs_reqs_a/requirements.txt
 RUN PYTHONDONTWRITEBYTECODE=1 uv pip install --system --no-cache-dir -c /api/constraints.txt -r /deps/outer-graphs_reqs_a/graphs_reqs_a/requirements.txt
 # -- End of local requirements install --
 # -- Adding local package ../../examples --
-COPY --from=examples . /deps/examples
+COPY --from=examples --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env . /deps/examples
 # -- End of local package ../../examples --
 # -- Adding non-package dependency unit_tests --
-ADD . /deps/outer-unit_tests/unit_tests
+ADD --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env . /deps/outer-unit_tests/unit_tests
 RUN set -ex && \\
     for line in '[project]' \\
                 'name = "unit_tests"' \\
@@ -692,7 +696,7 @@ RUN set -ex && \\
     done
 # -- End of non-package dependency unit_tests --
 # -- Adding non-package dependency graphs_reqs_a --
-COPY --from=outer-graphs_reqs_a . /deps/outer-graphs_reqs_a/graphs_reqs_a
+COPY --from=outer-graphs_reqs_a --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env . /deps/outer-graphs_reqs_a/graphs_reqs_a
 RUN set -ex && \\
     for line in '[project]' \\
                 'name = "graphs_reqs_a"' \\
@@ -732,10 +736,12 @@ def test_config_to_docker_outside_path():
     )
     expected_docker_stdin = (
         """\
-# syntax=docker/dockerfile:1.4
+# syntax=docker/dockerfile:1.19
 FROM langchain/langgraph-api:3.11
+# BuildKit is required: the classic builder ignores ADD/COPY --exclude
+RUN --network=default true
 # -- Adding non-package dependency unit_tests --
-ADD . /deps/outer-unit_tests/unit_tests
+ADD --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env . /deps/outer-unit_tests/unit_tests
 RUN set -ex && \\
     for line in '[project]' \\
                 'name = "unit_tests"' \\
@@ -749,7 +755,7 @@ RUN set -ex && \\
     done
 # -- End of non-package dependency unit_tests --
 # -- Adding non-package dependency tests --
-COPY --from=outer-tests . /deps/outer-tests/tests
+COPY --from=outer-tests --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env . /deps/outer-tests/tests
 RUN set -ex && \\
     for line in '[project]' \\
                 'name = "tests"' \\
@@ -793,10 +799,13 @@ def test_config_to_docker_pipconfig():
     )
     expected_docker_stdin = (
         """\
+# syntax=docker/dockerfile:1.19
 FROM langchain/langgraph-api:3.11
+# BuildKit is required: the classic builder ignores ADD/COPY --exclude
+RUN --network=default true
 ADD pipconfig.txt /pipconfig.txt
 # -- Adding non-package dependency unit_tests --
-ADD . /deps/outer-unit_tests/unit_tests
+ADD --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env . /deps/outer-unit_tests/unit_tests
 RUN set -ex && \\
     for line in '[project]' \\
                 'name = "unit_tests"' \\
@@ -856,9 +865,12 @@ def test_config_to_docker_local_deps():
         base_image="langchain/langgraph-api-custom",
     )
     expected_docker_stdin = f"""\
+# syntax=docker/dockerfile:1.19
 FROM langchain/langgraph-api-custom:3.11
+# BuildKit is required: the classic builder ignores ADD/COPY --exclude
+RUN --network=default true
 # -- Adding non-package dependency graphs --
-ADD ./graphs /deps/outer-graphs/src
+ADD --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env ./graphs /deps/outer-graphs/src
 RUN set -ex && \\
     for line in '[project]' \\
                 'name = "graphs"' \\
@@ -903,9 +915,12 @@ dependencies = ["langchain"]"""
     )
     os.remove(pyproject_path)
     expected_docker_stdin = (
-        """FROM langchain/langgraph-api:3.11
+        """# syntax=docker/dockerfile:1.19
+FROM langchain/langgraph-api:3.11
+# BuildKit is required: the classic builder ignores ADD/COPY --exclude
+RUN --network=default true
 # -- Adding local package . --
-ADD . /deps/unit_tests
+ADD --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env . /deps/unit_tests
 # -- End of local package . --
 # -- Installing all local dependencies --
 RUN for dep in /deps/*; do             echo "Installing $dep";             if [ -d "$dep" ]; then                 echo "Installing $dep";                 (cd "$dep" && PYTHONDONTWRITEBYTECODE=1 uv pip install --system --no-cache-dir -c /api/constraints.txt -e .);             fi;         done
@@ -936,13 +951,16 @@ def test_config_to_docker_end_to_end():
         ),
         base_image="langchain/langgraph-api",
     )
-    expected_docker_stdin = f"""FROM langchain/langgraph-api:3.12
+    expected_docker_stdin = f"""# syntax=docker/dockerfile:1.19
+FROM langchain/langgraph-api:3.12
+# BuildKit is required: the classic builder ignores ADD/COPY --exclude
+RUN --network=default true
 ARG meow
 ARG foo
 ADD pipconfig.txt /pipconfig.txt
 RUN PIP_CONFIG_FILE=/pipconfig.txt PYTHONDONTWRITEBYTECODE=1 uv pip install --system --no-cache-dir -c /api/constraints.txt langchain langchain_openai
 # -- Adding non-package dependency graphs --
-ADD ./graphs/ /deps/outer-graphs/src
+ADD --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env ./graphs/ /deps/outer-graphs/src
 RUN set -ex && \\
     for line in '[project]' \\
                 'name = "graphs"' \\
@@ -981,10 +999,13 @@ def test_config_to_docker_nodejs():
         ),
         base_image="langchain/langgraphjs-api",
     )
-    expected_docker_stdin = """FROM langchain/langgraphjs-api:20
+    expected_docker_stdin = """# syntax=docker/dockerfile:1.19
+FROM langchain/langgraphjs-api:20
+# BuildKit is required: the classic builder ignores ADD/COPY --exclude
+RUN --network=default true
 ARG meow
 ARG foo
-ADD . /deps/unit_tests
+ADD --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env . /deps/unit_tests
 WORKDIR /deps/unit_tests
 RUN npm i
 ENV LANGGRAPH_AUTH='{"path": "./graphs/auth.mts:auth"}'
@@ -1069,10 +1090,13 @@ def test_config_to_docker_nodejs_internal_docker_tag():
         ),
         base_image="langchain/langgraphjs-api",
     )
-    expected_docker_stdin = """FROM langchain/langgraphjs-api:my-tag
+    expected_docker_stdin = """# syntax=docker/dockerfile:1.19
+FROM langchain/langgraphjs-api:my-tag
+# BuildKit is required: the classic builder ignores ADD/COPY --exclude
+RUN --network=default true
 ARG meow
 ARG foo
-ADD . /deps/unit_tests
+ADD --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env . /deps/unit_tests
 WORKDIR /deps/unit_tests
 RUN npm i
 ENV LANGGRAPH_AUTH='{"path": "./graphs/auth.mts:auth"}'
@@ -1180,10 +1204,13 @@ def test_config_to_docker_gen_ui_python():
         base_image="langchain/langgraph-api",
     )
 
-    expected_docker_stdin = f"""FROM langchain/langgraph-api:3.11
+    expected_docker_stdin = f"""# syntax=docker/dockerfile:1.19
+FROM langchain/langgraph-api:3.11
+# BuildKit is required: the classic builder ignores ADD/COPY --exclude
+RUN --network=default true
 RUN /storage/install-node.sh
 # -- Adding non-package dependency unit_tests --
-ADD . /deps/outer-unit_tests/unit_tests
+ADD --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env . /deps/outer-unit_tests/unit_tests
 RUN set -ex && \\
     for line in '[project]' \\
                 'name = "unit_tests"' \\
@@ -1227,10 +1254,13 @@ def test_config_to_docker_multiplatform():
         base_image="langchain/langgraph-api",
     )
 
-    expected_docker_stdin = f"""FROM langchain/langgraph-api:3.11
+    expected_docker_stdin = f"""# syntax=docker/dockerfile:1.19
+FROM langchain/langgraph-api:3.11
+# BuildKit is required: the classic builder ignores ADD/COPY --exclude
+RUN --network=default true
 RUN /storage/install-node.sh
 # -- Adding non-package dependency unit_tests --
-ADD . /deps/outer-unit_tests/unit_tests
+ADD --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env . /deps/outer-unit_tests/unit_tests
 RUN set -ex && \\
     for line in '[project]' \\
                 'name = "unit_tests"' \\
@@ -1419,11 +1449,11 @@ def test_config_to_docker_uv_lock():
         assert additional_contexts == {"uv-workspace-root": str(project_root.resolve())}
 
         assert (
-            "COPY --from=uv-workspace-root apps/agent /deps/workspace/apps/agent"
+            f"COPY --from=uv-workspace-root {ENV_EXCLUDE_FLAGS} apps/agent /deps/workspace/apps/agent"
             in docker
         )
         assert (
-            "COPY --from=uv-workspace-root libs/shared /deps/workspace/libs/shared"
+            f"COPY --from=uv-workspace-root {ENV_EXCLUDE_FLAGS} libs/shared /deps/workspace/libs/shared"
             in docker
         )
         assert "libs/extra /deps/workspace/libs/extra" not in docker
@@ -1439,12 +1469,8 @@ def test_config_to_docker_uv_lock():
         assert shared_install in docker
         assert agent_workdir in docker
         assert agent_install in docker
-        shared_copy = (
-            "COPY --from=uv-workspace-root libs/shared /deps/workspace/libs/shared"
-        )
-        agent_copy = (
-            "COPY --from=uv-workspace-root apps/agent /deps/workspace/apps/agent"
-        )
+        shared_copy = f"COPY --from=uv-workspace-root {ENV_EXCLUDE_FLAGS} libs/shared /deps/workspace/libs/shared"
+        agent_copy = f"COPY --from=uv-workspace-root {ENV_EXCLUDE_FLAGS} apps/agent /deps/workspace/apps/agent"
         assert docker.index(shared_copy) < docker.index(shared_workdir)
         assert docker.index(shared_workdir) < docker.index(agent_copy)
         assert docker.index(shared_workdir) < docker.index(agent_workdir)
@@ -1485,7 +1511,7 @@ def test_config_to_docker_uv_lock_honors_root_workspace_sources():
         )
 
         assert (
-            "COPY --from=uv-workspace-root libs/shared /deps/workspace/libs/shared"
+            f"COPY --from=uv-workspace-root {ENV_EXCLUDE_FLAGS} libs/shared /deps/workspace/libs/shared"
             in docker
         )
         assert (
@@ -1536,11 +1562,11 @@ def test_config_to_docker_uv_lock_ignores_unrelated_workspace_package_sources():
         )
 
         assert (
-            "COPY --from=uv-workspace-root libs/shared /deps/workspace/libs/shared"
+            f"COPY --from=uv-workspace-root {ENV_EXCLUDE_FLAGS} libs/shared /deps/workspace/libs/shared"
             in docker
         )
         assert (
-            "COPY --from=uv-workspace-root libs/badlib /deps/workspace/libs/badlib"
+            f"COPY --from=uv-workspace-root {ENV_EXCLUDE_FLAGS} libs/badlib /deps/workspace/libs/badlib"
             not in docker
         )
 
@@ -1574,11 +1600,11 @@ def test_config_to_docker_uv_lock_ignores_unrelated_root_sources():
         )
 
         assert (
-            "COPY --from=uv-workspace-root libs/shared /deps/workspace/libs/shared"
+            f"COPY --from=uv-workspace-root {ENV_EXCLUDE_FLAGS} libs/shared /deps/workspace/libs/shared"
             in docker
         )
         assert (
-            "COPY --from=uv-workspace-root libs/extra /deps/workspace/libs/extra"
+            f"COPY --from=uv-workspace-root {ENV_EXCLUDE_FLAGS} libs/extra /deps/workspace/libs/extra"
             not in docker
         )
 
@@ -1664,7 +1690,7 @@ def test_config_to_docker_uv_lock_accepts_path_workspace_sources():
         )
 
         assert (
-            "COPY --from=uv-workspace-root libs/shared /deps/workspace/libs/shared"
+            f"COPY --from=uv-workspace-root {ENV_EXCLUDE_FLAGS} libs/shared /deps/workspace/libs/shared"
             in docker
         )
 
@@ -1716,7 +1742,7 @@ def test_config_to_docker_uv_lock_accepts_root_path_workspace_sources():
         )
 
         assert (
-            "COPY --from=uv-workspace-root libs/shared /deps/workspace/libs/shared"
+            f"COPY --from=uv-workspace-root {ENV_EXCLUDE_FLAGS} libs/shared /deps/workspace/libs/shared"
             in docker
         )
         assert (
@@ -1925,10 +1951,10 @@ def test_config_to_docker_uv_lock_skips_dockerignore_entries():
         )
 
         for excluded in (
-            "ADD .git ",
+            f"ADD {ENV_EXCLUDE_FLAGS} .git ",
             "ADD .gitignore ",
-            "ADD .venv ",
-            "ADD __pycache__ ",
+            f"ADD {ENV_EXCLUDE_FLAGS} .venv ",
+            f"ADD {ENV_EXCLUDE_FLAGS} __pycache__ ",
             "ADD secrets.env ",
         ):
             assert excluded not in docker, (
@@ -1938,7 +1964,7 @@ def test_config_to_docker_uv_lock_skips_dockerignore_entries():
         # The .dockerignore itself is still part of the context and should be
         # ADDed (Docker needs it at build time, and archive.py includes it).
         assert "ADD .dockerignore /deps/workspace/.dockerignore" in docker
-        assert "ADD src /deps/workspace/src" in docker
+        assert f"ADD {ENV_EXCLUDE_FLAGS} src /deps/workspace/src" in docker
         assert "ADD README.md /deps/workspace/README.md" in docker
 
 
@@ -2024,7 +2050,10 @@ def test_config_to_docker_uv_lock_skips_dockerignore_entries_in_workspace():
             config_path, config, base_image="langchain/langgraph-api:0.2.47"
         )
 
-        assert "COPY --from=uv-workspace-root src /deps/workspace/src" in docker
+        assert (
+            f"COPY --from=uv-workspace-root {ENV_EXCLUDE_FLAGS} src /deps/workspace/src"
+            in docker
+        )
         assert (
             "COPY --from=uv-workspace-root README.md /deps/workspace/README.md"
             in docker
@@ -2038,7 +2067,7 @@ def test_config_to_docker_uv_lock_skips_dockerignore_entries_in_workspace():
         # Workspace members themselves are still copied via their own per-member
         # COPY line — the sibling filter must not disturb this.
         assert (
-            "COPY --from=uv-workspace-root apps/agent /deps/workspace/apps/agent"
+            f"COPY --from=uv-workspace-root {ENV_EXCLUDE_FLAGS} apps/agent /deps/workspace/apps/agent"
             in docker
         )
 
@@ -2085,7 +2114,7 @@ def test_config_to_docker_uv_lock_preserves_negated_dockerignore_descendants():
             base_image="langchain/langgraph-api:0.2.47",
         )
 
-        assert "ADD assets /deps/workspace/assets" not in docker
+        assert f"ADD {ENV_EXCLUDE_FLAGS} assets /deps/workspace/assets" not in docker
         assert "ADD assets/keep.txt /deps/workspace/assets/keep.txt" in docker
         assert "assets/drop.txt" not in docker
 
@@ -2197,7 +2226,7 @@ def test_config_to_docker_uv_lock_never_reincludes_always_excluded_subtrees():
 
         assert ".venv/pkg/keep.txt" not in docker
         assert "node_modules/pkg/package.json" not in docker
-        assert "ADD src /deps/workspace/src" in docker
+        assert f"ADD {ENV_EXCLUDE_FLAGS} src /deps/workspace/src" in docker
 
 
 def test_config_to_docker_uv_lock_rejects_ignored_workspace_member():
@@ -2338,14 +2367,20 @@ def test_config_to_docker_uv_lock_root_package_copy_skips_unrelated_members():
             config_path, config, base_image="langchain/langgraph-api:0.2.47"
         )
 
-        assert "COPY --from=uv-workspace-root . /deps/workspace" not in docker
-        assert "COPY --from=uv-workspace-root src /deps/workspace/src" in docker
+        assert (
+            f"COPY --from=uv-workspace-root {ENV_EXCLUDE_FLAGS} . /deps/workspace"
+            not in docker
+        )
+        assert (
+            f"COPY --from=uv-workspace-root {ENV_EXCLUDE_FLAGS} src /deps/workspace/src"
+            in docker
+        )
         assert (
             "COPY --from=uv-workspace-root README.md /deps/workspace/README.md"
             in docker
         )
         assert (
-            "COPY --from=uv-workspace-root libs/extra /deps/workspace/libs/extra"
+            f"COPY --from=uv-workspace-root {ENV_EXCLUDE_FLAGS} libs/extra /deps/workspace/libs/extra"
             not in docker
         )
         assert "WORKDIR /deps/workspace" in docker
@@ -2467,9 +2502,12 @@ def test_config_to_compose_simple_config():
         build:
             context: .
             dockerfile_inline: |
+                # syntax=docker/dockerfile:1.19
                 FROM langchain/langgraph-api:3.11
+                # BuildKit is required: the classic builder ignores ADD/COPY --exclude
+                RUN --network=default true
                 # -- Adding non-package dependency unit_tests --
-                ADD . /deps/outer-unit_tests/unit_tests
+                ADD --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env . /deps/outer-unit_tests/unit_tests
                 RUN set -ex && \\
                     for line in '[project]' \\
                                 'name = "unit_tests"' \\
@@ -2508,9 +2546,12 @@ def test_config_to_compose_env_vars():
         build:
             context: .
             dockerfile_inline: |
+                # syntax=docker/dockerfile:1.19
                 FROM langchain/langgraph-api-custom:3.11
+                # BuildKit is required: the classic builder ignores ADD/COPY --exclude
+                RUN --network=default true
                 # -- Adding non-package dependency unit_tests --
-                ADD . /deps/outer-unit_tests/unit_tests
+                ADD --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env . /deps/outer-unit_tests/unit_tests
                 RUN set -ex && \\
                     for line in '[project]' \\
                                 'name = "unit_tests"' \\
@@ -2553,9 +2594,12 @@ def test_config_to_compose_env_file():
         build:
             context: .
             dockerfile_inline: |
+                # syntax=docker/dockerfile:1.19
                 FROM langchain/langgraph-api:3.11
+                # BuildKit is required: the classic builder ignores ADD/COPY --exclude
+                RUN --network=default true
                 # -- Adding non-package dependency unit_tests --
-                ADD . /deps/outer-unit_tests/unit_tests
+                ADD --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env . /deps/outer-unit_tests/unit_tests
                 RUN set -ex && \\
                     for line in '[project]' \\
                                 'name = "unit_tests"' \\
@@ -2591,9 +2635,12 @@ def test_config_to_compose_watch():
         build:
             context: .
             dockerfile_inline: |
+                # syntax=docker/dockerfile:1.19
                 FROM langchain/langgraph-api:3.11
+                # BuildKit is required: the classic builder ignores ADD/COPY --exclude
+                RUN --network=default true
                 # -- Adding non-package dependency unit_tests --
-                ADD . /deps/outer-unit_tests/unit_tests
+                ADD --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env . /deps/outer-unit_tests/unit_tests
                 RUN set -ex && \\
                     for line in '[project]' \\
                                 'name = "unit_tests"' \\
@@ -2638,9 +2685,12 @@ def test_config_to_compose_end_to_end():
         build:
             context: .
             dockerfile_inline: |
+                # syntax=docker/dockerfile:1.19
                 FROM langchain/langgraph-api:3.11
+                # BuildKit is required: the classic builder ignores ADD/COPY --exclude
+                RUN --network=default true
                 # -- Adding non-package dependency unit_tests --
-                ADD . /deps/outer-unit_tests/unit_tests
+                ADD --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env . /deps/outer-unit_tests/unit_tests
                 RUN set -ex && \\
                     for line in '[project]' \\
                                 'name = "unit_tests"' \\
@@ -3145,7 +3195,7 @@ def test_config_to_docker_with_api_version():
 
     # Check that the FROM line uses the api_version
     lines = actual_docker_stdin.split("\n")
-    from_line = lines[0]
+    from_line = next(line for line in lines if line.startswith("FROM "))
     assert from_line == "FROM langchain/langgraph-api:0.2.74-py3.11"
 
     # Test Node.js config with api_version
@@ -3159,7 +3209,7 @@ def test_config_to_docker_with_api_version():
 
     # Check that the FROM line uses the api_version
     lines = actual_docker_stdin.split("\n")
-    from_line = lines[0]
+    from_line = next(line for line in lines if line.startswith("FROM "))
     assert from_line == "FROM langchain/langgraphjs-api:0.2.74-node20"
 
 

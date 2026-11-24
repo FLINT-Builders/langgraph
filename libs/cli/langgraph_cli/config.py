@@ -11,11 +11,21 @@ from typing import Literal, NamedTuple
 import click
 import httpx
 
+from langgraph_cli._ignore import _configured_env_paths, _docker_exclude_flags
 from langgraph_cli.schemas import Config, Distros
 from langgraph_cli.uv_lock import python_config_to_docker_uv_lock
 
 MIN_NODE_VERSION = "20"
 DEFAULT_NODE_VERSION = "20"
+
+# `ADD/COPY --exclude` is generally available from Dockerfile frontend 1.19.
+DOCKERFILE_SYNTAX_LINE = "# syntax=docker/dockerfile:1.19"
+# The classic builder silently ignores `--exclude` but rejects RUN flags, so
+# this no-op step stops it before any source is copied.
+REQUIRE_BUILDKIT_LINES = (
+    "# BuildKit is required: the classic builder ignores ADD/COPY --exclude",
+    "RUN --network=default true",
+)
 
 DISALLOWED_BUILD_COMMAND_CHARS = [
     '"',
@@ -1301,6 +1311,11 @@ def python_config_to_docker(
     # collect dependencies
     pypi_deps = [dep for dep in config["dependencies"] if not dep.startswith(".")]
     local_deps = _assemble_local_deps(config_path, config)
+    env_paths = _configured_env_paths(config_path, config)
+    exclude_flags = {
+        fullpath: _docker_exclude_flags(fullpath, env_paths)
+        for fullpath in (*local_deps.real_pkgs, *local_deps.faux_pkgs)
+    }
     # Rewrite graph paths, so they point to the correct location in the Docker container
     _update_graph_paths(config_path, config, local_deps)
     # Rewrite auth path, so it points to the correct location in the Docker container
@@ -1337,10 +1352,10 @@ def python_config_to_docker(
     faux_pkgs_str = f"{os.linesep}{os.linesep}".join(
         (
             f"""# -- Adding non-package dependency {fullpath.name} --
-COPY --from=outer-{fullpath.name} . {destpath}"""
+COPY --from=outer-{fullpath.name} {exclude_flags[fullpath]} . {destpath}"""
             if fullpath in local_deps.additional_contexts
             else f"""# -- Adding non-package dependency {fullpath.name} --
-ADD {relpath} {destpath}"""
+ADD {exclude_flags[fullpath]} {relpath} {destpath}"""
         )
         + f"""
 RUN set -ex && \\
@@ -1361,11 +1376,11 @@ RUN set -ex && \\
     local_pkgs_str = os.linesep.join(
         (
             f"""# -- Adding local package {relpath} --
-COPY --from={name} . /deps/{name}
+COPY --from={name} {exclude_flags[fullpath]} . /deps/{name}
 # -- End of local package {relpath} --"""
             if fullpath in local_deps.additional_contexts
             else f"""# -- Adding local package {relpath} --
-ADD {relpath} /deps/{name}
+ADD {exclude_flags[fullpath]} {relpath} /deps/{name}
 # -- End of local package {relpath} --"""
         )
         for fullpath, (relpath, name) in local_deps.real_pkgs.items()
@@ -1432,14 +1447,9 @@ ADD {relpath} /deps/{name}
     # Prepare docker file contents
     docker_file_contents = []
 
-    # Add syntax directive if we have additional contexts (requires BuildKit frontend.contexts capability)
-    if additional_contexts:
-        docker_file_contents.extend(
-            [
-                "# syntax=docker/dockerfile:1.4",
-                "",
-            ]
-        )
+    # Named contexts and `--exclude` both need a BuildKit Dockerfile frontend
+    if exclude_flags:
+        docker_file_contents.extend([DOCKERFILE_SYNTAX_LINE, ""])
 
     # Add main dockerfile content
     dep_vname = "$$dep" if escape_variables else "$dep"
@@ -1450,9 +1460,11 @@ ADD {relpath} /deps/{name}
                 (cd "{dep_vname}" && {global_reqs_pip_install} -e .); \
             fi; \
         done"""
+    docker_file_contents.append(f"FROM {image_str}")
+    if exclude_flags:
+        docker_file_contents.extend(REQUIRE_BUILDKIT_LINES)
     docker_file_contents.extend(
         [
-            f"FROM {image_str}",
             "",
             os.linesep.join(config["dockerfile_lines"]),
             "",
@@ -1530,12 +1542,20 @@ def node_config_to_docker(
     else:
         build_workdir = faux_path
 
+    source_root = pathlib.Path(build_context) if build_context else config_path.parent
+    exclude_flags = _docker_exclude_flags(
+        source_root, _configured_env_paths(config_path, config)
+    )
+
     docker_file_contents = [
+        DOCKERFILE_SYNTAX_LINE,
+        "",
         f"FROM {image_str}",
+        *REQUIRE_BUILDKIT_LINES,
         "",
         os.linesep.join(config["dockerfile_lines"]),
         "",
-        f"ADD . {faux_path if not build_context else container_root}",
+        f"ADD {exclude_flags} . {faux_path if not build_context else container_root}",
         "",
         f"WORKDIR {install_workdir}",
         "",
