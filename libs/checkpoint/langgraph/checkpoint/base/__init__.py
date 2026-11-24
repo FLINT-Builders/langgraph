@@ -755,19 +755,39 @@ def get_checkpoint_id(config: RunnableConfig) -> str | None:
     return config["configurable"].get("checkpoint_id")
 
 
+def _is_sensitive_configurable_key(key: str) -> bool:
+    key_lower = key.casefold()
+    return any(substr in key_lower for substr in _SENSITIVE_CONFIGURABLE_SUBSTRINGS)
+
+
 def get_checkpoint_metadata(
     config: RunnableConfig, metadata: CheckpointMetadata
 ) -> CheckpointMetadata:
-    """Get checkpoint metadata in a backwards-compatible manner."""
+    """Get checkpoint metadata in a backwards-compatible manner.
+
+    Primitive values from `config["metadata"]` and `config["configurable"]` are
+    copied in, except for `configurable` keys that look like credentials (their
+    name contains `key`, `token`, `secret`, `password`, or `auth`). Savers store
+    metadata outside the configured serializer, so it is not covered by
+    `EncryptedSerializer`; pass secrets through the runtime `context` instead.
+    """
     metadata = {
         k: v.replace("\u0000", "") if isinstance(v, str) else v
         for k, v in metadata.items()
     }
-    for obj in (config.get("metadata"), config.get("configurable")):
+    configurable = config.get("configurable") or {}
+    for obj in (config.get("metadata"), configurable):
         if not obj:
             continue
         for key, v in obj.items():
-            if key in metadata or key in EXCLUDED_METADATA_KEYS or key.startswith("__"):
+            if (
+                key in metadata
+                or key in EXCLUDED_METADATA_KEYS
+                or key.startswith("__")
+                # `config["metadata"]` can hold copies of `configurable` entries
+                # (langchain-core < 1.0 `ensure_config` copies them over).
+                or (key in configurable and _is_sensitive_configurable_key(key))
+            ):
                 continue
             elif isinstance(v, str):
                 metadata[key] = v.replace("\u0000", "")
@@ -806,6 +826,8 @@ EXCLUDED_METADATA_KEYS = {
     "langgraph_path",
     "langgraph_checkpoint_ns",
 }
+
+_SENSITIVE_CONFIGURABLE_SUBSTRINGS = ("key", "token", "secret", "password", "auth")
 
 # --- below are deprecated utilities used by past versions of LangGraph ---
 
