@@ -25,6 +25,7 @@ from langgraph.store.base import (
     BaseStore,
     GetOp,
     IndexConfig,
+    InvalidNamespaceError,
     Item,
     ListNamespacesOp,
     Op,
@@ -619,6 +620,7 @@ class BasePostgresStore(Generic[C]):
                 conditions.append("(expires_at IS NULL OR expires_at > NOW())")
             if op.match_conditions:
                 for condition in op.match_conditions:
+                    _validate_namespace_labels(tuple(condition.path))
                     if condition.match_type in ("prefix", "suffix"):
                         if not condition.path:
                             # An empty path constrains nothing; skipping keeps it a
@@ -1275,8 +1277,29 @@ def _get_index_params(store: Any) -> tuple[str, dict[str, Any]]:
     return kind, sanitized
 
 
+def _validate_namespace_labels(namespace: tuple[str, ...]) -> None:
+    """Reject labels that the dot-joined encoding cannot represent.
+
+    Labels are joined with an unescaped `.`, so a label containing `.` would
+    encode to the same prefix as the tuple split at that dot
+    (`("a.b",)` and `("a", "b")`) and read, overwrite, or list that namespace.
+    """
+    for label in namespace:
+        if not isinstance(label, str):
+            raise InvalidNamespaceError(
+                f"Invalid namespace label '{label}' found in {namespace}. Namespace"
+                f" labels must be strings, but got {type(label).__name__}."
+            )
+        if "." in label:
+            raise InvalidNamespaceError(
+                f"Invalid namespace label '{label}' found in {namespace}. Namespace"
+                " labels cannot contain periods ('.')."
+            )
+
+
 def _namespace_to_text(namespace: tuple[str, ...]) -> str:
     """Convert namespace tuple to text string."""
+    _validate_namespace_labels(namespace)
     return ".".join(namespace)
 
 
