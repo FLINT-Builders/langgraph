@@ -877,6 +877,8 @@ def python_config_to_docker_uv_lock(
         DEFAULT_NODE_VERSION,
         _build_python_install_commands,
         _build_runtime_env_vars,
+        _ensure_dockerfile_safe_name,
+        _ensure_dockerfile_safe_path,
         _get_node_pm_install_cmd,
         _get_pip_cleanup_lines,
         _image_supports_uv,
@@ -895,6 +897,8 @@ def python_config_to_docker_uv_lock(
         config, install_cmd
     )
     plan = _plan_uv_lock_workspace(config_path, config)
+    _ensure_dockerfile_safe_path(str(plan.project_root), "uv project root")
+    _ensure_dockerfile_safe_name(plan.working_dir, "Working directory")
 
     _update_uv_lock_graph_paths(config_path, config, plan)
     for section, key in [
@@ -925,6 +929,8 @@ def python_config_to_docker_uv_lock(
     def copy_from_project_root(
         relative_path: pathlib.PurePosixPath, destination: str
     ) -> str:
+        _ensure_dockerfile_safe_name(relative_path.as_posix(), "Path")
+        _ensure_dockerfile_safe_name(destination, "Path")
         if workspace_context_name is not None:
             source = relative_path.as_posix() or "."
             return f"COPY --from={workspace_context_name} {source} {destination}"
@@ -1011,6 +1017,7 @@ def python_config_to_docker_uv_lock(
     ignore_spec = _build_ignore_spec(plan.project_root, include_gitignore=False)
     for package in plan.install_order:
         package_label = package.root.relative_to(plan.project_root).as_posix() or "."
+        _ensure_dockerfile_safe_name(package_label, "Workspace package path")
         docker_plan.add_raw(f"# -- Adding workspace package {package_label} --")
         for source, destination in _uv_lock_package_copy_items(
             package, plan, ignore_spec
