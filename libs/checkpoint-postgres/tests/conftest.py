@@ -11,6 +11,13 @@ DEFAULT_POSTGRES_URI = "postgres://postgres:postgres@localhost:5441/"
 DEFAULT_URI = "postgres://postgres:postgres@localhost:5441/postgres?sslmode=disable"
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "no_db: test does not connect to Postgres",
+    )
+
+
 @pytest.fixture(scope="function")
 async def conn() -> AsyncIterator[AsyncConnection[DictRow]]:
     async with await AsyncConnection.connect(
@@ -20,8 +27,11 @@ async def conn() -> AsyncIterator[AsyncConnection[DictRow]]:
 
 
 @pytest.fixture(scope="function", autouse=True)
-async def clear_test_db(conn: AsyncConnection[DictRow]) -> None:
+async def clear_test_db(request: pytest.FixtureRequest) -> None:
     """Delete all tables before each test."""
+    if request.node.get_closest_marker("no_db"):
+        return
+    conn: AsyncConnection[DictRow] = request.getfixturevalue("conn")
     try:
         await conn.execute("DELETE FROM checkpoints")
         await conn.execute("DELETE FROM checkpoint_blobs")
