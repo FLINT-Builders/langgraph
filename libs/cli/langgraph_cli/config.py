@@ -78,6 +78,81 @@ def has_disallowed_build_command_content(command: str) -> bool:
     return False
 
 
+# Values below are written into generated Dockerfile instructions (FROM, ADD),
+# so they must not be able to carry line breaks, whitespace, quoting, or
+# variable expansion. Character classes are spelled out so that non-ASCII
+# digits and letters never match.
+_PYTHON_VERSION_PATTERN = re.compile(
+    r"(?P<major>[0-9]+)\.(?P<minor>[0-9]+)(?:-(?P<suffix>[A-Za-z0-9][A-Za-z0-9_.-]*))?"
+)
+_NODE_VERSION_PATTERN = re.compile(r"[0-9]+")
+_DOCKER_TAG_PATTERN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
+_DOCKER_DOMAIN_COMPONENT = r"(?:[A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9])"
+_DOCKER_PATH_COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+_DOCKER_IMAGE_PATTERN = re.compile(
+    rf"(?:{_DOCKER_DOMAIN_COMPONENT}(?:\.{_DOCKER_DOMAIN_COMPONENT})*(?::[0-9]+)?/)?"
+    rf"{_DOCKER_PATH_COMPONENT}(?:/{_DOCKER_PATH_COMPONENT})*"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?"
+    r"(?:@[A-Za-z][A-Za-z0-9]*(?:[-_+.][A-Za-z][A-Za-z0-9]*)*:[0-9A-Fa-f]{32,})?"
+)
+_MAX_DOCKER_IMAGE_LENGTH = 512
+_IMAGE_REFERENCE_CHARS_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/@-]*")
+_PIP_CONFIG_FILE_PATTERN = re.compile(r"[A-Za-z0-9_.@+,=~/][A-Za-z0-9_.@+,=~/-]*")
+
+
+def _is_valid_base_image(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) <= _MAX_DOCKER_IMAGE_LENGTH
+        and _DOCKER_IMAGE_PATTERN.fullmatch(value) is not None
+    )
+
+
+def _is_valid_docker_tag(value: object) -> bool:
+    return isinstance(value, str) and _DOCKER_TAG_PATTERN.fullmatch(value) is not None
+
+
+def _is_valid_pip_config_file(value: object) -> bool:
+    return (
+        isinstance(value, str) and _PIP_CONFIG_FILE_PATTERN.fullmatch(value) is not None
+    )
+
+
+def _ensure_base_image(base_image: object) -> None:
+    if not _is_valid_base_image(base_image):
+        raise click.UsageError(
+            f"Invalid base_image: {base_image!r}. "
+            "Use a Docker image reference, e.g.:\n"
+            '  "base_image": "langchain/langgraph-server:0.2"'
+        )
+
+
+def _ensure_docker_tag(value: object, field: str) -> None:
+    if not _is_valid_docker_tag(value):
+        raise click.UsageError(
+            f"Invalid {field}: {value!r}. A Docker tag may only contain letters, "
+            "digits, '_', '.', and '-' (at most 128 characters)."
+        )
+
+
+def _ensure_pip_config_file(value: object) -> None:
+    if not _is_valid_pip_config_file(value):
+        raise click.UsageError(
+            f"Invalid pip_config_file: {value!r}. Use a relative path made of "
+            "letters, digits, and '_', '.', '-', '/', e.g.:\n"
+            '  "pip_config_file": "pipconfig.txt"'
+        )
+
+
+def _ensure_single_line(value: str, field: str) -> None:
+    """Reject values that could start a new line in a generated Dockerfile."""
+    if any(not char.isprintable() for char in value):
+        raise click.UsageError(
+            f"Invalid {field}: {value!r}. "
+            "Line breaks and control characters are not allowed."
+        )
+
+
 MIN_PYTHON_VERSION = "3.11"
 DEFAULT_PYTHON_VERSION = "3.11"
 
@@ -147,6 +222,8 @@ def _parse_node_version(version_str: str) -> int:
     try:
         if "." in version_str:
             raise ValueError("Node.js version must be major version only")
+        if not _NODE_VERSION_PATTERN.fullmatch(version_str):
+            raise ValueError("Node.js version must be a number")
         return int(version_str)
     except ValueError:
         raise click.UsageError(
@@ -348,15 +425,18 @@ def validate_config(config: Config) -> Config:
     if api_version:
         try:
             compatible_match = _API_VERSION_RANGE_PATTERN.fullmatch(api_version)
-            parts = _parse_api_version_parts(
+            version_str = (
                 compatible_match.group("version").strip()
                 if compatible_match
                 else api_version
             )
+            parts = _parse_api_version_parts(version_str)
             if len(parts) > 3:
                 raise ValueError(
                     "Version must be major or major.minor or major.minor.patch."
                 )
+            if not _is_valid_docker_tag(version_str):
+                raise ValueError("Version must be usable as a Docker tag.")
         except (TypeError, ValueError):
             raise click.UsageError(
                 f"Invalid version format: {api_version}.\n\n"
@@ -391,6 +471,19 @@ def validate_config(config: Config) -> Config:
         config["_INTERNAL_docker_tag"] = internal_docker_tag
     if api_version:
         config["api_version"] = api_version
+
+    if config.get("base_image"):
+        _ensure_base_image(config["base_image"])
+    if internal_docker_tag:
+        _ensure_docker_tag(internal_docker_tag, "_INTERNAL_docker_tag")
+    if config.get("pip_config_file"):
+        _ensure_pip_config_file(config["pip_config_file"])
+    if not isinstance(config["dependencies"], list) or not all(
+        isinstance(dep, str) for dep in config["dependencies"]
+    ):
+        raise click.UsageError("`dependencies` must be a list of strings.")
+    for dep in config["dependencies"]:
+        _ensure_single_line(dep, "dependency")
 
     if config.get("node_version"):
         node_version = config["node_version"]
@@ -430,10 +523,11 @@ def validate_config(config: Config) -> Config:
 
     if config.get("python_version"):
         pyversion = config["python_version"]
-        if not pyversion.count(".") == 1 or not all(
-            part.isdigit() for part in pyversion.split("-")[0].split(".")
+        if (
+            not isinstance(pyversion, str)
+            or _PYTHON_VERSION_PATTERN.fullmatch(pyversion) is None
         ):
-            parts = pyversion.split("-")[0].split(".")
+            parts = str(pyversion).split("-")[0].split(".")
             fix = f"{parts[0]}.{parts[1]}" if len(parts) >= 2 else MIN_PYTHON_VERSION
             raise click.UsageError(
                 f"Invalid Python version format: {pyversion}. "
@@ -741,6 +835,7 @@ def _assemble_local_deps(config_path: pathlib.Path, config: Config) -> LocalDeps
     additional_contexts: list[pathlib.Path] = []
 
     for local_dep in config["dependencies"]:
+        _ensure_single_line(local_dep, "dependency")
         if not local_dep.startswith("."):
             # If the dependency is not a local path, skip it
             continue
@@ -748,6 +843,7 @@ def _assemble_local_deps(config_path: pathlib.Path, config: Config) -> LocalDeps
         # Verify that the local dependency can be resolved
         # (e.g., this would raise an informative error if a user mistyped a path).
         resolved = (config_path.parent / local_dep).resolve()
+        _ensure_single_line(resolved.name, "local dependency directory name")
 
         # validate local dependency
         if not resolved.exists():
@@ -1114,6 +1210,7 @@ def _build_python_install_commands(
     global_reqs_pip_install = base_install
 
     if config.get("pip_config_file"):
+        _ensure_pip_config_file(config["pip_config_file"])
         local_reqs_pip_install = (
             f"PIP_CONFIG_FILE=/pipconfig.txt {local_reqs_pip_install}"
         )
@@ -1129,36 +1226,42 @@ def _build_python_install_commands(
     return local_reqs_pip_install, global_reqs_pip_install, pip_config_file_str
 
 
+def _env_json(value: object) -> str:
+    # The JSON is wrapped in single quotes in an ENV instruction, so a literal
+    # quote would end the value early. `\u0027` is the same JSON string.
+    return json.dumps(value).replace("'", "\\u0027")
+
+
 def _build_runtime_env_vars(config: Config) -> list[str]:
     env_vars = []
 
     if (store_config := config.get("store")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_STORE='{json.dumps(store_config)}'")
+        env_vars.append(f"ENV LANGGRAPH_STORE='{_env_json(store_config)}'")
 
     if (auth_config := config.get("auth")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_AUTH='{json.dumps(auth_config)}'")
+        env_vars.append(f"ENV LANGGRAPH_AUTH='{_env_json(auth_config)}'")
 
     if (encryption_config := config.get("encryption")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_ENCRYPTION='{json.dumps(encryption_config)}'")
+        env_vars.append(f"ENV LANGGRAPH_ENCRYPTION='{_env_json(encryption_config)}'")
 
     if (http_config := config.get("http")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_HTTP='{json.dumps(http_config)}'")
+        env_vars.append(f"ENV LANGGRAPH_HTTP='{_env_json(http_config)}'")
 
     if (webhooks_config := config.get("webhooks")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_WEBHOOKS='{json.dumps(webhooks_config)}'")
+        env_vars.append(f"ENV LANGGRAPH_WEBHOOKS='{_env_json(webhooks_config)}'")
 
     if (checkpointer_config := config.get("checkpointer")) is not None:
         env_vars.append(
-            f"ENV LANGGRAPH_CHECKPOINTER='{json.dumps(checkpointer_config)}'"
+            f"ENV LANGGRAPH_CHECKPOINTER='{_env_json(checkpointer_config)}'"
         )
 
     if (ui := config.get("ui")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_UI='{json.dumps(ui)}'")
+        env_vars.append(f"ENV LANGGRAPH_UI='{_env_json(ui)}'")
 
     if (ui_config := config.get("ui_config")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_UI_CONFIG='{json.dumps(ui_config)}'")
+        env_vars.append(f"ENV LANGGRAPH_UI_CONFIG='{_env_json(ui_config)}'")
 
-    env_vars.append(f"ENV LANGSERVE_GRAPHS='{json.dumps(config['graphs'])}'")
+    env_vars.append(f"ENV LANGSERVE_GRAPHS='{_env_json(config['graphs'])}'")
     return env_vars
 
 
@@ -1345,7 +1448,7 @@ ADD {relpath} {destpath}"""
         + f"""
 RUN set -ex && \\
     for line in '[project]' \\
-                'name = "{fullpath.name}"' \\
+                {shlex.quote(f'name = "{fullpath.name}"')} \\
                 'version = "0.1"' \\
                 '[tool.setuptools.package-data]' \\
                 '"*" = ["**/*"]' \\
@@ -1503,6 +1606,7 @@ def node_config_to_docker(
     else:
         # Backward compatibility: use the original behavior
         faux_path = f"/deps/{config_path.parent.name}"
+    _ensure_single_line(faux_path, "project directory")
 
     image_str = docker_tag(config, base_image, api_version)
 
@@ -1568,13 +1672,29 @@ def docker_tag(
     base_image: str | None = None,
     api_version: str | None = None,
 ) -> str:
+    image = _docker_tag(config, base_image, api_version)
+    if (
+        len(image) > _MAX_DOCKER_IMAGE_LENGTH
+        or _IMAGE_REFERENCE_CHARS_PATTERN.fullmatch(image) is None
+    ):
+        raise click.UsageError(f"Invalid Docker image reference: {image!r}.")
+    return image
+
+
+def _docker_tag(
+    config: Config,
+    base_image: str | None,
+    api_version: str | None,
+) -> str:
     api_version = api_version or config.get("api_version")
     base_image = base_image or default_base_image(config)
+    _ensure_base_image(base_image)
 
     image_distro = config.get("image_distro")
     distro_tag = "" if image_distro == DEFAULT_IMAGE_DISTRO else f"-{image_distro}"
 
     if config.get("_INTERNAL_docker_tag"):
+        _ensure_docker_tag(config["_INTERNAL_docker_tag"], "_INTERNAL_docker_tag")
         return f"{base_image}:{config['_INTERNAL_docker_tag']}"
 
     # Build the standard tag format
@@ -1591,6 +1711,7 @@ def docker_tag(
         api_version = _resolve_compatible_api_version(
             api_version, base_image, f"{language}{version_distro_tag}"
         )
+        _ensure_docker_tag(api_version, "api_version")
         full_tag = f"{api_version}-{language}{version_distro_tag}"
     elif "/langgraph-server" in base_image and version_distro_tag not in base_image:
         return f"{base_image}-{language}{version_distro_tag}"
@@ -1648,6 +1769,16 @@ def config_to_docker(
     )
 
 
+_YAML_PLAIN_SCALAR_PATTERN = re.compile(r"[A-Za-z0-9_.][A-Za-z0-9_./-]*")
+
+
+def _yaml_scalar(value: str) -> str:
+    """Render a string as a YAML scalar that cannot add keys or lines."""
+    if _YAML_PLAIN_SCALAR_PATTERN.fullmatch(value):
+        return value
+    return json.dumps(value)
+
+
 def config_to_compose(
     config_path: pathlib.Path,
     config: Config,
@@ -1660,9 +1791,13 @@ def config_to_compose(
     base_image = base_image or default_base_image(config)
 
     env_vars = config["env"].items() if isinstance(config["env"], dict) else {}
-    env_vars_str = "\n".join(f'            {k}: "{v}"' for k, v in env_vars)
+    env_vars_str = "\n".join(
+        f"            {_yaml_scalar(str(k))}: {json.dumps(str(v))}" for k, v in env_vars
+    )
     env_file_str = (
-        f"env_file: {config['env']}" if isinstance(config["env"], str) else ""
+        f"env_file: {_yaml_scalar(config['env'])}"
+        if isinstance(config["env"], str)
+        else ""
     )
     if watch:
         dependencies = config.get("dependencies") or ["."]
