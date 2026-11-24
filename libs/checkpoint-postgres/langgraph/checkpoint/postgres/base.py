@@ -11,11 +11,13 @@ from langgraph.checkpoint.base import (
     WRITES_IDX_MAP,
     BaseCheckpointSaver,
     ChannelVersions,
+    Checkpoint,
     DeltaChannelHistory,
     PendingWrite,
     get_checkpoint_id,
 )
-from langgraph.checkpoint.serde.types import TASKS
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langgraph.checkpoint.serde.types import TASKS, _DeltaSnapshot
 from psycopg.types.json import Jsonb
 
 # Page size for stage-1 paged scan in `get_delta_channel_history`. Internal
@@ -228,8 +230,9 @@ def _build_delta_stage1_sql(channels: Sequence[str], *, paged: bool) -> str:
       `checkpoint_blobs`. `hb_i` ("has blob") probes for one. The probe hits
       that table's primary key `(thread_id, checkpoint_ns, channel, version)`
       exactly, so it is an index lookup per row per channel.
-    * **inline** — `None`, `str`, `int`, `float` and `bool` stay in the
-      checkpoint's own `channel_values` and get no blob row at all. `inline_i`
+    * **inline** — with the default `JsonPlusSerializer`, `None`, `str`,
+      `int`, `float` and `bool` stay in the checkpoint's own `channel_values`
+      and get no blob row at all (see `_split_channel_values`). `inline_i`
       returns that value.
 
     Testing only for a key in `channel_values` (the previous approach) missed
@@ -545,6 +548,40 @@ class BasePostgresSaver(BaseCheckpointSaver[str]):
                     entry["seed"] = seed_inline_by_ch[ch]
             result[ch] = entry
         return result
+
+    def _split_channel_values(
+        self, checkpoint: Checkpoint, new_versions: ChannelVersions
+    ) -> tuple[dict[str, Any], dict[str, Any], ChannelVersions]:
+        """Split channel values between the checkpoint row and `checkpoint_blobs`.
+
+        Returns `(inline_values, blob_values, blob_versions)`. `inline_values`
+        is written verbatim to the `checkpoints.checkpoint` JSONB column, so it
+        bypasses `serde`. Primitives are only kept there when `serde` is
+        exactly the default `JsonPlusSerializer`; with any other serializer
+        (e.g. `EncryptedSerializer`) every channel value goes through `serde`.
+
+        A primitive that is not inlined but has no new version may have been
+        written inline by an earlier checkpoint, leaving no blob for its
+        current version, so it is (idempotently) upserted at that version.
+        """
+        inline_primitives = type(self.serde) is JsonPlusSerializer
+        channel_versions = checkpoint["channel_versions"]
+        inline_values: dict[str, Any] = {}
+        blob_values: dict[str, Any] = {}
+        blob_versions: ChannelVersions = {}
+        for k, v in checkpoint["channel_values"].items():
+            is_primitive = v is None or isinstance(v, (str, int, float, bool))
+            if is_primitive and inline_primitives:
+                inline_values[k] = v
+                continue
+            if isinstance(v, _DeltaSnapshot):
+                inline_values[k] = True
+            blob_values[k] = v
+            if k in new_versions:
+                blob_versions[k] = new_versions[k]
+            elif is_primitive and k in channel_versions:
+                blob_versions[k] = channel_versions[k]
+        return inline_values, blob_values, blob_versions
 
     def _dump_blobs(
         self,
