@@ -57,6 +57,8 @@ dev = [
 
 [tool.uv]
 default-groups = ['dev']
+# TraceContextTextMapPropagator's traceparent regex backtracks quadratically before 1.45.2.
+constraint-dependencies = ["opentelemetry-api>=1.45.2"]
 
 [tool.hatch.build.targets.wheel]
 include = ["langgraph_cli"]

@@ -79,6 +79,9 @@ dev = [
     "jupyter",
 ]
 
+[tool.uv]
+# TraceContextTextMapPropagator's traceparent regex backtracks quadratically before 1.45.2.
+constraint-dependencies = ["opentelemetry-api>=1.45.2"]
 
 [tool.uv.sources]
 langgraph-prebuilt = { path = "../prebuilt", editable = true }
