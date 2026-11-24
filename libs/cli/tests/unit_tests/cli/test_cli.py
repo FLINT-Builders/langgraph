@@ -1113,8 +1113,25 @@ def test_dockerfile_command_with_api_version_nodejs() -> None:
             assert "FROM langchain/langgraphjs-api:0.2.74-node20" in dockerfile
 
 
-def test_build_command_with_api_version() -> None:
+def _record_docker_build_stdin(monkeypatch) -> list[str]:
+    """Stub out docker for `langgraph build` and record the piped Dockerfile."""
+    dockerfiles: list[str] = []
+
+    async def fake_subp_exec(cmd, *args, input=None, **kwargs):
+        if input is not None:
+            dockerfiles.append(input)
+        return None, None
+
+    monkeypatch.setattr("langgraph_cli.docker.subp_exec", fake_subp_exec)
+    monkeypatch.setattr(
+        "langgraph_cli.cli.shutil.which", lambda name: f"/usr/bin/{name}"
+    )
+    return dockerfiles
+
+
+def test_build_command_with_api_version(monkeypatch) -> None:
     """Test the 'build' command with --api-version flag."""
+    dockerfiles = _record_docker_build_stdin(monkeypatch)
     runner = CliRunner()
     config_content = {
         "python_version": "3.11",
@@ -1144,13 +1161,14 @@ def test_build_command_with_api_version() -> None:
                 catch_exceptions=True,
             )
 
-        # Check that the build command is called with the correct tag
-        # The output should contain the docker build command with the api_version tag
-        assert "langchain/langgraph-api:0.2.74-py3.11-wolfi" in result.output
+        assert result.exit_code == 0, result.output
+        assert len(dockerfiles) == 1
+        assert "FROM langchain/langgraph-api:0.2.74-py3.11-wolfi" in dockerfiles[0]
 
 
-def test_build_command_with_api_version_and_base_image() -> None:
+def test_build_command_with_api_version_and_base_image(monkeypatch) -> None:
     """Test the 'build' command with both --api-version and --base-image flags."""
+    dockerfiles = _record_docker_build_stdin(monkeypatch)
     runner = CliRunner()
     config_content = {
         "python_version": "3.12",
@@ -1182,8 +1200,9 @@ def test_build_command_with_api_version_and_base_image() -> None:
                 catch_exceptions=True,
             )
 
-        # Check that the build command includes the api_version
-        assert "my-registry/custom-api:1.0.0-py3.12-wolfi" in result.output
+        assert result.exit_code == 0, result.output
+        assert len(dockerfiles) == 1
+        assert "FROM my-registry/custom-api:1.0.0-py3.12-wolfi" in dockerfiles[0]
 
 
 def test_prepare_args_and_stdin_with_api_version() -> None:

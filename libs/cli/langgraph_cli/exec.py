@@ -40,7 +40,9 @@ async def subp_exec(
     if verbose:
         cmd_str = f"+ {cmd} {' '.join(map(str, args))}"
         if input:
-            print(cmd_str, " <\n", "\n".join(filter(None, input.splitlines())), sep="")
+            # stdin can carry credentials (e.g. `docker login --password-stdin`),
+            # so only its size is ever printed.
+            print(f"{cmd_str} < <stdin: {len(input.encode())} bytes>")
         else:
             print(cmd_str)
     if wait:
