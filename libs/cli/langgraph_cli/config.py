@@ -49,6 +49,32 @@ _API_VERSION_PART_PATTERN = re.compile(
     r"(?:\.(?P<patch>\d+))?"
     r"(?:(?:\.|)(?P<pre>dev|rc)(?P<pre_n>\d+))?$"
 )
+# Characters that end a Dockerfile line, or a line of the compose YAML that
+# embeds it (`str.splitlines` and YAML both treat NEL, LS and PS as breaks).
+_DOCKERFILE_LINE_BREAK_PATTERN = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def _ensure_dockerfile_safe_path(value: str, description: str) -> None:
+    """Refuse a host path that would split the generated Dockerfile line it is written into."""
+    if _DOCKERFILE_LINE_BREAK_PATTERN.search(value):
+        raise ValueError(
+            f"{description} {value!r} contains control or line-break characters "
+            "and cannot be used in a generated Dockerfile. Rename it."
+        )
+
+
+def _ensure_dockerfile_safe_name(value: str, description: str) -> None:
+    """Refuse a directory name or container path that could break a Dockerfile line.
+
+    A backslash is refused too: BuildKit joins the next line onto any line that
+    ends with one, and these values can end a line.
+    """
+    _ensure_dockerfile_safe_path(value, description)
+    if "\\" in value:
+        raise ValueError(
+            f"{description} {value!r} contains a backslash and cannot be used in "
+            "a generated Dockerfile. Rename it."
+        )
 
 
 class _ParsedApiVersion(NamedTuple):
@@ -748,6 +774,9 @@ def _assemble_local_deps(config_path: pathlib.Path, config: Config) -> LocalDeps
         # Verify that the local dependency can be resolved
         # (e.g., this would raise an informative error if a user mistyped a path).
         resolved = (config_path.parent / local_dep).resolve()
+        _ensure_dockerfile_safe_path(local_dep, "Local dependency")
+        _ensure_dockerfile_safe_path(str(resolved), "Local dependency path")
+        _ensure_dockerfile_safe_name(resolved.name, "Local dependency directory")
 
         # validate local dependency
         if not resolved.exists():
@@ -1324,7 +1353,7 @@ def python_config_to_docker(
             )
             for reqpath, destpath in local_deps.pip_reqs
         )
-        pip_reqs_str += f"{os.linesep}RUN {local_reqs_pip_install} {' '.join('-r ' + r for _, r in local_deps.pip_reqs)}"
+        pip_reqs_str += f"{os.linesep}RUN {local_reqs_pip_install} {' '.join('-r ' + shlex.quote(r) for _, r in local_deps.pip_reqs)}"
         pip_reqs_str = f"""# -- Installing local requirements --
 {pip_reqs_str}
 # -- End of local requirements install --"""
@@ -1345,7 +1374,7 @@ ADD {relpath} {destpath}"""
         + f"""
 RUN set -ex && \\
     for line in '[project]' \\
-                'name = "{fullpath.name}"' \\
+                {shlex.quote(f'name = "{fullpath.name}"')} \\
                 'version = "0.1"' \\
                 '[tool.setuptools.package-data]' \\
                 '"*" = ["**/*"]' \\
@@ -1503,6 +1532,9 @@ def node_config_to_docker(
     else:
         # Backward compatibility: use the original behavior
         faux_path = f"/deps/{config_path.parent.name}"
+    _ensure_dockerfile_safe_path(faux_path, "Project directory")
+    _ensure_dockerfile_safe_name(config_path.parent.name, "Project directory")
+    _ensure_dockerfile_safe_name(config_path.parent.resolve().name, "Project directory")
 
     image_str = docker_tag(config, base_image, api_version)
 
@@ -1512,6 +1544,7 @@ def node_config_to_docker(
     if build_context:
         # Monorepo case: install from root, build from config directory
         container_root = f"/deps/{pathlib.Path(build_context).name}"
+        _ensure_dockerfile_safe_name(container_root, "Build context directory")
         install_workdir = container_root
         install_step = f"RUN {install_cmd}"
 
