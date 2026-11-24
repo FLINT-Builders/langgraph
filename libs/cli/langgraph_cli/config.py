@@ -1615,6 +1615,34 @@ def _calculate_relative_workdir(config_path: pathlib.Path, build_context: str) -
         ) from None
 
 
+def resolve_env_file_in_project(
+    project_dir: pathlib.Path, env_file: str
+) -> tuple[pathlib.Path, tuple[str, ...]]:
+    """Resolve an `env` file path and require it to stay inside `project_dir`.
+
+    Returns the resolved project directory and the components of the resolved
+    env file path relative to it. Symlinks are resolved before the check, so a
+    link inside the project that points outside of it is refused as well.
+    """
+    if os.path.isabs(env_file) or pathlib.PurePath(env_file).anchor:
+        raise click.UsageError(
+            f"env file '{env_file}' in langgraph.json must be a path relative to "
+            "the directory containing langgraph.json."
+        )
+    base = project_dir.resolve()
+    target = (base / env_file).resolve()
+    try:
+        parts = target.relative_to(base).parts
+    except ValueError:
+        parts = ()
+    if not parts:
+        raise click.UsageError(
+            f"env file '{env_file}' in langgraph.json must be a file inside "
+            f"the project directory '{base}'."
+        )
+    return base, parts
+
+
 def config_to_docker(
     config_path: pathlib.Path,
     config: Config,
@@ -1661,9 +1689,10 @@ def config_to_compose(
 
     env_vars = config["env"].items() if isinstance(config["env"], dict) else {}
     env_vars_str = "\n".join(f'            {k}: "{v}"' for k, v in env_vars)
-    env_file_str = (
-        f"env_file: {config['env']}" if isinstance(config["env"], str) else ""
-    )
+    env_file_str = ""
+    if isinstance(config["env"], str):
+        _, env_parts = resolve_env_file_in_project(config_path.parent, config["env"])
+        env_file_str = f"env_file: {pathlib.PurePosixPath(*env_parts)}"
     if watch:
         dependencies = config.get("dependencies") or ["."]
         watch_paths = [config_path.name] + [
