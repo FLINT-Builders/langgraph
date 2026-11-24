@@ -2,6 +2,7 @@ import copy
 import json
 import pathlib
 import platform
+import secrets
 import shutil
 from collections.abc import Callable, Sequence
 from typing import Literal, NamedTuple
@@ -12,9 +13,33 @@ import langgraph_cli.config
 from langgraph_cli.exec import subp_exec
 
 ROOT = pathlib.Path(__file__).parent.resolve()
-DEFAULT_POSTGRES_URI = (
-    "postgres://postgres:postgres@langgraph-postgres:5432/postgres?sslmode=disable"
+BUNDLED_POSTGRES_USER = "postgres"
+BUNDLED_POSTGRES_DB = "postgres"
+# Postgres only applies POSTGRES_PASSWORD when it initializes an empty data
+# volume, so the healthcheck re-applies it over the container-local socket
+# (trusted by the image's default pg_hba.conf). This keeps volumes created with
+# an earlier password usable. `$$` defers expansion to the container shell.
+_BUNDLED_POSTGRES_HEALTHCHECK = (
+    'pg_isready -U "$$POSTGRES_USER" && '
+    "{ [ -f /tmp/.langgraph-password-synced ] || "
+    '{ echo "ALTER ROLE :\\"user\\" WITH PASSWORD :\'password\'" | '
+    'psql -v ON_ERROR_STOP=1 -q -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" '
+    '-v user="$$POSTGRES_USER" -v password="$$POSTGRES_PASSWORD" '
+    "&& touch /tmp/.langgraph-password-synced; }; }"
 )
+
+
+def generate_postgres_password() -> str:
+    """Return a new random password for the bundled Postgres superuser."""
+    return secrets.token_urlsafe(32)
+
+
+def bundled_postgres_uri(password: str) -> str:
+    """Return the URI services use to reach the bundled Postgres over the Compose network."""
+    return (
+        f"postgres://{BUNDLED_POSTGRES_USER}:{password}@langgraph-postgres:5432/"
+        f"{BUNDLED_POSTGRES_DB}?sslmode=disable"
+    )
 
 
 class Version(NamedTuple):
@@ -153,7 +178,7 @@ def debugger_compose(*, port: int | None = None, base_url: str | None = None) ->
             "depends_on": {
                 "langgraph-postgres": {"condition": "service_healthy"},
             },
-            "ports": [f'"{port}:3968"'],
+            "ports": [f'"127.0.0.1:{port}:3968"'],
         }
     }
 
@@ -195,6 +220,9 @@ def compose_as_dict(
     debugger_base_url: str | None = None,
     # postgres://user:password@host:port/database?option=value
     postgres_uri: str | None = None,
+    # Superuser password for the bundled database (used when postgres_uri is
+    # None). A random one is generated if omitted.
+    postgres_password: str | None = None,
     # If you are running against an already-built image, you can pass it here
     image: str | None = None,
     # Base image to use for the LangGraph API server
@@ -206,7 +234,9 @@ def compose_as_dict(
     """Create a docker compose file as a dictionary in YML style."""
     if postgres_uri is None:
         include_db = True
-        postgres_uri = DEFAULT_POSTGRES_URI
+        if postgres_password is None:
+            postgres_password = generate_postgres_password()
+        postgres_uri = bundled_postgres_uri(postgres_password)
     else:
         include_db = False
 
@@ -228,20 +258,20 @@ def compose_as_dict(
         }
     }
 
-    # Add Postgres service before langgraph-api if it is needed
+    # Add Postgres service before langgraph-api if it is needed. It is only
+    # reachable over the Compose network; do not publish it on the host.
     if include_db:
         services["langgraph-postgres"] = {
             "image": "pgvector/pgvector:pg16",
-            "ports": ['"5433:5432"'],
             "environment": {
-                "POSTGRES_DB": "postgres",
-                "POSTGRES_USER": "postgres",
-                "POSTGRES_PASSWORD": "postgres",
+                "POSTGRES_DB": BUNDLED_POSTGRES_DB,
+                "POSTGRES_USER": BUNDLED_POSTGRES_USER,
+                "POSTGRES_PASSWORD": json.dumps(postgres_password),
             },
             "command": ["postgres", "-c", "shared_preload_libraries=vector"],
             "volumes": ["langgraph-data:/var/lib/postgresql/data"],
             "healthcheck": {
-                "test": "pg_isready -U postgres",
+                "test": json.dumps(_BUNDLED_POSTGRES_HEALTHCHECK),
                 "start_period": "10s",
                 "timeout": "1s",
                 "retries": 5,
@@ -309,6 +339,7 @@ def compose(
     debugger_base_url: str | None = None,
     # postgres://user:password@host:port/database?option=value
     postgres_uri: str | None = None,
+    postgres_password: str | None = None,
     image: str | None = None,
     base_image: str | None = None,
     api_version: str | None = None,
@@ -321,6 +352,7 @@ def compose(
         debugger_port=debugger_port,
         debugger_base_url=debugger_base_url,
         postgres_uri=postgres_uri,
+        postgres_password=postgres_password,
         image=image,
         base_image=base_image,
         api_version=api_version,

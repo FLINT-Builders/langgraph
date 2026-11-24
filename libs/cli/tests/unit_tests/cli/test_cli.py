@@ -13,7 +13,12 @@ from click.testing import CliRunner
 import langgraph_cli.deploy as deploy_module
 from langgraph_cli.cli import cli, prepare_args_and_stdin
 from langgraph_cli.config import Config, _get_pip_cleanup_lines, validate_config
-from langgraph_cli.docker import DEFAULT_POSTGRES_URI, DockerCapabilities, Version
+from langgraph_cli.docker import (
+    _BUNDLED_POSTGRES_HEALTHCHECK,
+    DockerCapabilities,
+    Version,
+    bundled_postgres_uri,
+)
 from langgraph_cli.util import clean_empty_lines
 
 FORMATTED_CLEANUP_LINES = _get_pip_cleanup_lines(
@@ -26,6 +31,9 @@ DEFAULT_DOCKER_CAPABILITIES = DockerCapabilities(
     version_compose=Version(2, 27, 0),
     healthcheck_start_interval=True,
 )
+TEST_POSTGRES_PASSWORD = "test-postgres-password-placeholder"
+TEST_POSTGRES_URI = bundled_postgres_uri(TEST_POSTGRES_PASSWORD)
+POSTGRES_HEALTHCHECK = json.dumps(_BUNDLED_POSTGRES_HEALTHCHECK)
 
 
 @contextmanager
@@ -49,8 +57,12 @@ def temporary_config_folder(config_content: dict, levels: int = 0):
         shutil.rmtree(temp_dir)
 
 
-def test_prepare_args_and_stdin() -> None:
+def test_prepare_args_and_stdin(monkeypatch) -> None:
     # this basically serves as an end-to-end test for using config and docker helpers
+    monkeypatch.setattr(
+        "langgraph_cli.docker.generate_postgres_password",
+        lambda: TEST_POSTGRES_PASSWORD,
+    )
     config_path = pathlib.Path(__file__).parent / "langgraph.json"
     config = validate_config(
         Config(dependencies=[".", "../../.."], graphs={"agent": "agent.py:graph"})
@@ -91,12 +103,10 @@ services:
             retries: 5
     langgraph-postgres:
         image: pgvector/pgvector:pg16
-        ports:
-            - "5433:5432"
         environment:
             POSTGRES_DB: postgres
             POSTGRES_USER: postgres
-            POSTGRES_PASSWORD: postgres
+            POSTGRES_PASSWORD: "{TEST_POSTGRES_PASSWORD}"
         command:
             - postgres
             - -c
@@ -104,7 +114,7 @@ services:
         volumes:
             - langgraph-data:/var/lib/postgresql/data
         healthcheck:
-            test: pg_isready -U postgres
+            test: {POSTGRES_HEALTHCHECK}
             start_period: 10s
             timeout: 1s
             retries: 5
@@ -117,7 +127,7 @@ services:
             langgraph-postgres:
                 condition: service_healthy
         ports:
-            - "{debugger_port}:3968"
+            - "127.0.0.1:{debugger_port}:3968"
         environment:
             VITE_STUDIO_LOCAL_GRAPH_URL: {debugger_graph_url}
     langgraph-api:
@@ -130,7 +140,7 @@ services:
                 condition: service_healthy
         environment:
             REDIS_URI: redis://langgraph-redis:6379
-            POSTGRES_URI: {DEFAULT_POSTGRES_URI}
+            POSTGRES_URI: {TEST_POSTGRES_URI}
         healthcheck:
             test: python /api/healthcheck.py
             interval: 60s
@@ -171,8 +181,12 @@ services:
     assert clean_empty_lines(actual_stdin) == expected_stdin
 
 
-def test_prepare_args_and_stdin_with_image() -> None:
+def test_prepare_args_and_stdin_with_image(monkeypatch) -> None:
     # this basically serves as an end-to-end test for using config and docker helpers
+    monkeypatch.setattr(
+        "langgraph_cli.docker.generate_postgres_password",
+        lambda: TEST_POSTGRES_PASSWORD,
+    )
     config_path = pathlib.Path(__file__).parent / "langgraph.json"
     config = validate_config(
         Config(dependencies=[".", "../../.."], graphs={"agent": "agent.py:graph"})
@@ -214,12 +228,10 @@ services:
             retries: 5
     langgraph-postgres:
         image: pgvector/pgvector:pg16
-        ports:
-            - "5433:5432"
         environment:
             POSTGRES_DB: postgres
             POSTGRES_USER: postgres
-            POSTGRES_PASSWORD: postgres
+            POSTGRES_PASSWORD: "{TEST_POSTGRES_PASSWORD}"
         command:
             - postgres
             - -c
@@ -227,7 +239,7 @@ services:
         volumes:
             - langgraph-data:/var/lib/postgresql/data
         healthcheck:
-            test: pg_isready -U postgres
+            test: {POSTGRES_HEALTHCHECK}
             start_period: 10s
             timeout: 1s
             retries: 5
@@ -240,7 +252,7 @@ services:
             langgraph-postgres:
                 condition: service_healthy
         ports:
-            - "{debugger_port}:3968"
+            - "127.0.0.1:{debugger_port}:3968"
         environment:
             VITE_STUDIO_LOCAL_GRAPH_URL: {debugger_graph_url}
     langgraph-api:
@@ -253,7 +265,7 @@ services:
                 condition: service_healthy
         environment:
             REDIS_URI: redis://langgraph-redis:6379
-            POSTGRES_URI: {DEFAULT_POSTGRES_URI}
+            POSTGRES_URI: {TEST_POSTGRES_URI}
         image: my-cool-image
         healthcheck:
             test: python /api/healthcheck.py

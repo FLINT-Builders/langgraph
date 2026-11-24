@@ -1656,6 +1656,7 @@ def config_to_compose(
     image: str | None = None,
     watch: bool = False,
     engine_runtime_mode: str = "combined_queue_worker",
+    postgres_uri: str | None = None,
 ) -> str:
     base_image = base_image or default_base_image(config)
 
@@ -1723,6 +1724,8 @@ def config_to_compose(
 """
 
         if engine_runtime_mode == "distributed":
+            if not postgres_uri:
+                raise ValueError("postgres_uri is required for distributed mode")
             executor_base_image = default_base_image(
                 config_snapshot, engine_runtime_mode="distributed"
             )
@@ -1743,7 +1746,6 @@ def config_to_compose(
                 additional_contexts:
 {executor_additional_contexts_str}"""
 
-            postgres_uri = "postgres://postgres:postgres@langgraph-postgres:5432/postgres?sslmode=disable"
             result += f"""    langgraph-orchestrator:
         image: langchain/langgraph-orchestrator-licensed:latest
         depends_on:

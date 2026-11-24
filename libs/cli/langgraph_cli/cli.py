@@ -469,6 +469,18 @@ def build(
 # ---------------------------------------------------------------------------
 
 
+def _env_file_defines(env_path: pathlib.Path, name: str) -> bool:
+    """Return whether a dotenv file assigns a non-empty value to `name`."""
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("export "):
+            stripped = stripped[len("export ") :].lstrip()
+        key, sep, value = stripped.partition("=")
+        if sep and key.strip() == name and value.strip().strip("\"'"):
+            return True
+    return False
+
+
 def _get_docker_ignore_content() -> str:
     """Return the content of a .dockerignore file.
 
@@ -605,6 +617,7 @@ def dockerfile(
             compose_dict = langgraph_cli.docker.compose_as_dict(
                 capabilities,
                 port=8123,
+                postgres_password="${POSTGRES_PASSWORD}",
                 base_image=base_image,
             )
             # Add .env file to the docker-compose.yml for the langgraph-api service
@@ -623,9 +636,14 @@ def dockerfile(
             secho("✅ Created: docker-compose.yml", fg="green")
 
         # Check if the .env file exists in the same directory as the Dockerfile
-        if not (save_path.parent / ".env").exists():
+        env_path = save_path.parent / ".env"
+        postgres_password_line = (
+            f"POSTGRES_PASSWORD={langgraph_cli.docker.generate_postgres_password()}\n"
+        )
+        if not env_path.exists():
             # Also add an empty .env file
-            with open(str(save_path.parent / ".env"), "w", encoding="utf-8") as f:
+            fd = os.open(str(env_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with open(fd, "w", encoding="utf-8") as f:
                 f.writelines(
                     [
                         "# Uncomment the following line to add your LangSmith API key",
@@ -637,11 +655,23 @@ def dockerfile(
                         "\n",
                         "# LANGGRAPH_CLOUD_LICENSE_KEY=your-license-key",
                         "\n",
+                        "# Password for the bundled Postgres database in docker-compose.yml",
+                        "\n",
+                        postgres_password_line,
                         "# Add any other environment variables go below...",
                     ]
                 )
 
             secho("✅ Created: .env", fg="green")
+        elif not _env_file_defines(env_path, "POSTGRES_PASSWORD"):
+            # Keep the user's existing variables and only add the database
+            # password that docker-compose.yml interpolates.
+            existing = env_path.read_text(encoding="utf-8")
+            with open(env_path, "a", encoding="utf-8") as f:
+                if existing and not existing.endswith("\n"):
+                    f.write("\n")
+                f.write(postgres_password_line)
+            secho("✅ Updated: .env (added POSTGRES_PASSWORD)", fg="green")
         else:
             # Do nothing since the .env file already exists. Not a great
             # idea to overwrite in case the user has added custom env vars set
@@ -947,12 +977,20 @@ def prepare_args_and_stdin(
 ) -> tuple[list[str], str]:
     assert config_path.exists(), f"Config file not found: {config_path}"
     # prepare args
+    postgres_password = None
+    effective_postgres_uri = postgres_uri
+    if postgres_uri is None:
+        postgres_password = langgraph_cli.docker.generate_postgres_password()
+        effective_postgres_uri = langgraph_cli.docker.bundled_postgres_uri(
+            postgres_password
+        )
     stdin = langgraph_cli.docker.compose(
         capabilities,
         port=port,
         debugger_port=debugger_port,
         debugger_base_url=debugger_base_url,
         postgres_uri=postgres_uri,
+        postgres_password=postgres_password,
         image=image,
         base_image=base_image,
         api_version=api_version,
@@ -975,6 +1013,7 @@ def prepare_args_and_stdin(
         api_version=api_version,
         image=image,
         engine_runtime_mode=engine_runtime_mode,
+        postgres_uri=effective_postgres_uri,
     )
     return args, stdin
 
