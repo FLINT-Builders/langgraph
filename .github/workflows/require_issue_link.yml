@@ -441,15 +441,39 @@ jobs:
               console.log(`Closed PR #${prNumber}`);
             }
 
-            // Cancel all other in-progress and queued workflow runs for this PR
-            const headSha = context.payload.pull_request.head.sha;
-            for (const status of ['in_progress', 'queued']) {
+            // Cancel other in-progress and queued runs for this PR only.
+            // head_sha alone matches runs of main and of other PRs that share
+            // the commit, and a PR's head can be any branch in the fork
+            // network (including the base repo or another contributor's
+            // fork). Only cancel when the head is a fork owned by the PR
+            // author, and only runs from that exact head repo, branch, and SHA.
+            const pr = context.payload.pull_request;
+            const prHead = pr.head || {};
+            const prHeadRepo = prHead.repo;
+            const prHeadOwner = prHeadRepo?.full_name?.split('/')[0] ?? '';
+            const prAuthor = pr.user?.login ?? '';
+            const ownsHead =
+              prHeadRepo != null &&
+              prHeadRepo.full_name.toLowerCase() !== `${owner}/${repo}`.toLowerCase() &&
+              prAuthor !== '' &&
+              prHeadOwner.toLowerCase() === prAuthor.toLowerCase();
+            const belongsToThisPr = (run) =>
+              ['pull_request', 'pull_request_target'].includes(run.event) &&
+              run.head_sha === prHead.sha &&
+              run.head_branch === prHead.ref &&
+              run.head_repository?.id === prHeadRepo.id;
+            const cancelStatuses = ownsHead ? ['in_progress', 'queued'] : [];
+            if (!ownsHead) {
+              console.log(`PR head is not a fork owned by ${prAuthor} — not cancelling other runs`);
+            }
+            for (const status of cancelStatuses) {
               const runs = await github.paginate(
                 github.rest.actions.listWorkflowRunsForRepo,
-                { owner, repo, head_sha: headSha, status, per_page: 100 },
+                { owner, repo, head_sha: prHead.sha, status, per_page: 100 },
               );
               for (const run of runs) {
                 if (run.id === context.runId) continue;
+                if (!belongsToThisPr(run)) continue;
                 try {
                   await github.rest.actions.cancelWorkflowRun({
                     owner, repo, run_id: run.id,
