@@ -18,8 +18,8 @@ from langgraph_cli.deploy import (
     _docker_config_for_token,
     _Emitter,
     _env_without_deployment_name,
+    _load_env_file,
     _parse_env_from_config,
-    _resolve_env_path,
     _resolve_pushed_image_digest,
     _smith_dashboard_base_url,
     _validate_prebuilt_image,
@@ -212,11 +212,11 @@ class TestParseEnvFromConfig:
         assert result["EMPTY"] == ""
 
 
-class TestResolveEnvPath:
+class TestLoadEnvFile:
     def test_inline_env_dict_returns_none(self, tmp_path):
         config_path = tmp_path / "langgraph.json"
         config_path.touch()
-        assert _resolve_env_path({"env": {"FOO": "bar"}}, config_path) is None
+        assert _load_env_file({"env": {"FOO": "bar"}}, config_path) is None
 
     def test_relative_env_path_resolves(self, tmp_path):
         env_file = tmp_path / "custom.env"
@@ -224,19 +224,24 @@ class TestResolveEnvPath:
         config_path = tmp_path / "langgraph.json"
         config_path.touch()
 
-        resolved = _resolve_env_path({"env": "custom.env"}, config_path)
-        assert resolved == env_file.resolve()
+        loaded = _load_env_file({"env": "custom.env"}, config_path)
+        assert loaded is not None
+        assert loaded.path == env_file.resolve()
+        assert loaded.values == {"FOO": "bar"}
 
     def test_missing_env_file_returns_none(self, tmp_path):
         config_path = tmp_path / "langgraph.json"
         config_path.touch()
-        assert _resolve_env_path({"env": "missing.env"}, config_path) is None
+        assert _load_env_file({"env": "missing.env"}, config_path) is None
 
     def test_default_env_is_cwd_dotenv(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         config_path = tmp_path / "langgraph.json"
         config_path.touch()
-        assert _resolve_env_path({}, config_path) == tmp_path / ".env"
+        loaded = _load_env_file({}, config_path)
+        assert loaded is not None
+        assert loaded.path == tmp_path.resolve() / ".env"
+        assert loaded.values == {}
 
 
 class TestEnvWithoutDeploymentName:

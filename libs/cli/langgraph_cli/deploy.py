@@ -1,17 +1,20 @@
 """Deploy command and subcommands for the LangGraph CLI."""
 
 import base64
+import io
 import json as json_mod
 import os
 import pathlib
 import platform
 import re
+import stat
 import tempfile
 import time
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import BinaryIO
 
 import click
 import click.exceptions
@@ -501,35 +504,189 @@ def level_fg(level: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_env_path(
-    config_json: dict, config_path: pathlib.Path
-) -> pathlib.Path | None:
-    """Return the .env file path implied by the config, or None for inline dicts."""
+_CAN_OPEN_WITHOUT_SYMLINKS = (
+    os.open in os.supports_dir_fd
+    and hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "O_DIRECTORY")
+)
+
+
+@dataclass
+class _EnvFile:
+    """An env file confined to a project directory and the values read from it."""
+
+    project_dir: pathlib.Path
+    parts: tuple[str, ...]
+    values: dict[str, str]
+    exists: bool
+    # The open file the values were read from, kept for writing back to it.
+    handle: BinaryIO | None = None
+
+    @property
+    def path(self) -> pathlib.Path:
+        return self.project_dir.joinpath(*self.parts)
+
+    def close(self) -> None:
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+
+def _open_in_project(
+    project_dir: pathlib.Path, parts: tuple[str, ...], flags: int
+) -> int:
+    """Open `parts` beneath `project_dir` without following any symlink.
+
+    `parts` comes from an already resolved path, so every component is expected
+    to be a real directory or file; a component that has since been swapped for
+    a symlink makes the open fail instead of leaving the project.
+    """
+    flags |= getattr(os, "O_BINARY", 0)
+    if not _CAN_OPEN_WITHOUT_SYMLINKS:
+        return os.open(project_dir.joinpath(*parts), flags, 0o600)
+    dir_fd = os.open(project_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            next_fd = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd
+            )
+            os.close(dir_fd)
+            dir_fd = next_fd
+        return os.open(parts[-1], flags | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _load_env_file(
+    config_json: dict, config_path: pathlib.Path, *, writable: bool = False
+) -> _EnvFile | None:
+    """Read the .env file implied by the config, or None for inline dicts.
+
+    A string `env` must name a file inside the directory containing
+    langgraph.json; without one, `.env` in the current directory is used and
+    must stay inside that directory. With `writable`, the file is kept open so
+    that `_save_env_key` writes to the same file the values came from; the
+    caller must `close()` it.
+    """
     env_field = config_json.get("env")
     if isinstance(env_field, dict) and env_field:
         return None
     if isinstance(env_field, str):
-        env_path = (config_path.parent / env_field).resolve()
-        if not env_path.exists():
+        project_dir, parts = langgraph_cli.config.resolve_env_file_in_project(
+            config_path.parent, env_field
+        )
+    else:
+        project_dir, parts = langgraph_cli.config.resolve_env_file_in_project(
+            pathlib.Path.cwd(), ".env"
+        )
+    display_path = project_dir.joinpath(*parts)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    try:
+        try:
+            fd = _open_in_project(
+                project_dir,
+                parts,
+                (os.O_RDWR if writable else os.O_RDONLY) | nonblock,
+            )
+        except PermissionError:
+            if not writable:
+                raise
+            writable = False
+            fd = _open_in_project(project_dir, parts, os.O_RDONLY | nonblock)
+    except FileNotFoundError:
+        if isinstance(env_field, str):
             _get_emitter().note(
                 f"Warning: env file '{env_field}' specified in langgraph.json not found."
             )
             return None
-        return env_path
-    return pathlib.Path.cwd() / ".env"
+        return _EnvFile(project_dir, parts, {}, exists=False)
+    except OSError as exc:
+        raise click.ClickException(
+            f"Could not open env file '{display_path}': {exc.strerror or exc}"
+        ) from None
+    f = os.fdopen(fd, "r+b" if writable else "rb")
+    try:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise click.ClickException(
+                f"Env file '{display_path}' is not a regular file."
+            )
+        content = f.read().decode("utf-8")
+    except BaseException:
+        f.close()
+        raise
+    if not writable:
+        f.close()
+    values = dotenv_values(stream=io.StringIO(content))
+    return _EnvFile(
+        project_dir,
+        parts,
+        {k: v for k, v in values.items() if v is not None},
+        exists=True,
+        handle=f if writable else None,
+    )
+
+
+def _read_env_from_config(
+    config_json: dict, config_path: pathlib.Path, *, writable: bool = False
+) -> tuple[dict[str, str], _EnvFile | None]:
+    """Resolve env vars from langgraph.json 'env' field or a .env fallback.
+
+    Also returns the env file the values were read from, if any.
+    """
+    env_field = config_json.get("env")
+    if isinstance(env_field, dict) and env_field:
+        return {str(k): str(v) for k, v in env_field.items()}, None
+    env_file = _load_env_file(config_json, config_path, writable=writable)
+    if env_file is None:
+        return {}, None
+    return dict(env_file.values), env_file
 
 
 def _parse_env_from_config(
     config_json: dict, config_path: pathlib.Path
 ) -> dict[str, str]:
     """Resolve env vars from langgraph.json 'env' field or a .env fallback."""
-    env_field = config_json.get("env")
-    if isinstance(env_field, dict) and env_field:
-        return {str(k): str(v) for k, v in env_field.items()}
-    env_path = _resolve_env_path(config_json, config_path)
-    if env_path is None:
-        return {}
-    return {k: v for k, v in dotenv_values(env_path).items() if v is not None}
+    return _read_env_from_config(config_json, config_path)[0]
+
+
+def _with_dotenv_key(content: str, key: str, value: str) -> str:
+    """Return `content` with `key` set to `value`, formatted like `set_key`."""
+    with tempfile.TemporaryDirectory() as tmp:
+        scratch = pathlib.Path(tmp) / ".env"
+        scratch.write_bytes(content.encode("utf-8"))
+        set_key(str(scratch), key, value)
+        return scratch.read_bytes().decode("utf-8")
+
+
+def _save_env_key(env_file: _EnvFile, key: str, value: str) -> bool:
+    """Write `key` into the env file the deploy values were read from.
+
+    Returns False if that file was opened read-only and cannot be updated.
+    """
+    if env_file.exists:
+        if env_file.handle is None:
+            return False
+        f = env_file.handle
+        f.seek(0)
+        updated = _with_dotenv_key(f.read().decode("utf-8"), key, value)
+        f.seek(0)
+        f.write(updated.encode("utf-8"))
+        f.truncate()
+        f.flush()
+        return True
+    try:
+        fd = _open_in_project(
+            env_file.project_dir,
+            env_file.parts,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        )
+    except OSError as exc:
+        raise click.ClickException(
+            f"Could not create env file '{env_file.path}': {exc.strerror or exc}"
+        ) from None
+    with os.fdopen(fd, "wb") as f:
+        f.write(_with_dotenv_key("", key, value).encode("utf-8"))
+    return True
 
 
 def _env_without_deployment_name(env_vars: dict[str, str]) -> dict[str, str]:
@@ -1616,23 +1773,31 @@ def _deploy_cmd(
     config_json = langgraph_cli.config.validate_config_file(config)
     warn_non_wolfi_distro(config_json, emit=em.note)
 
-    env_vars = _parse_env_from_config(config_json, config)
-
-    if not deployment_id and not name:
-        name = env_vars.get(_DEPLOYMENT_NAME_ENV)
-    if not deployment_id and not name:
-        default_name = normalize_name(pathlib.Path.cwd().name)
-        if no_input:
-            name = default_name
-        else:
-            name = click.prompt("Deployment name", default=default_name)
-    if name and not deployment_id:
-        name = normalize_name(name)
-        if not no_input:
-            env_path = _resolve_env_path(config_json, config)
-            if env_path is not None:
-                set_key(str(env_path), _DEPLOYMENT_NAME_ENV, name)
-                em.info(f"Saved deployment name to {env_path}")
+    env_vars, env_file = _read_env_from_config(
+        config_json, config, writable=not no_input and not deployment_id
+    )
+    try:
+        if not deployment_id and not name:
+            name = env_vars.get(_DEPLOYMENT_NAME_ENV)
+        if not deployment_id and not name:
+            default_name = normalize_name(pathlib.Path.cwd().name)
+            if no_input:
+                name = default_name
+            else:
+                name = click.prompt("Deployment name", default=default_name)
+        if name and not deployment_id:
+            name = normalize_name(name)
+            if not no_input and env_file is not None:
+                if _save_env_key(env_file, _DEPLOYMENT_NAME_ENV, name):
+                    em.info(f"Saved deployment name to {env_file.path}")
+                else:
+                    em.warn(
+                        f"Could not save deployment name to {env_file.path}: "
+                        "file is not writable."
+                    )
+    finally:
+        if env_file is not None:
+            env_file.close()
 
     secrets = _secrets_from_env(_env_without_deployment_name(env_vars))
 
