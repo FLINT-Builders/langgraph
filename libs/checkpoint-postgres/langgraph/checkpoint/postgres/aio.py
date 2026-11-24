@@ -18,7 +18,6 @@ from langgraph.checkpoint.base import (
     get_serializable_checkpoint_metadata,
 )
 from langgraph.checkpoint.serde.base import SerializerProtocol
-from langgraph.checkpoint.serde.types import _DeltaSnapshot
 from psycopg import AsyncConnection, AsyncCursor, AsyncPipeline, Capabilities
 from psycopg.rows import DictRow, dict_row
 from psycopg.types.json import Jsonb
@@ -256,7 +255,6 @@ class AsyncPostgresSaver(BasePostgresSaver):
         checkpoint_id = configurable.pop("checkpoint_id", None)
 
         copy = checkpoint.copy()
-        copy["channel_values"] = copy["channel_values"].copy()
         next_config = {
             "configurable": {
                 "thread_id": thread_id,
@@ -265,22 +263,12 @@ class AsyncPostgresSaver(BasePostgresSaver):
             }
         }
 
-        # inline primitive values in checkpoint table
-        # others are stored in blobs table
-        blob_values = {}
-        for k, v in checkpoint["channel_values"].items():
-            if isinstance(v, _DeltaSnapshot):
-                blob_values[k] = copy["channel_values"].pop(k)
-                copy["channel_values"][k] = True
-            elif v is None or isinstance(v, (str, int, float, bool)):
-                pass
-            else:
-                blob_values[k] = copy["channel_values"].pop(k)
+        copy["channel_values"], blob_values, blob_versions = self._split_channel_values(
+            checkpoint, new_versions
+        )
 
         async with self._cursor(pipeline=True) as cur:
-            if blob_versions := {
-                k: v for k, v in new_versions.items() if k in blob_values
-            }:
+            if blob_versions:
                 await cur.executemany(
                     self.UPSERT_CHECKPOINT_BLOBS_SQL,
                     await asyncio.to_thread(
