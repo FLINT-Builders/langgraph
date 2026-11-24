@@ -1190,16 +1190,16 @@ def test_sanitize_config():
     basic_config: RunnableConfig = {
         "recursion_limit": 10,
         "tags": ["tag1", "tag2"],
-        "metadata": {"str_key": "value", "int_key": 42, "bool_key": True},
+        "metadata": {"str_field": "value", "int_field": 42, "bool_field": True},
         "configurable": {"param1": "value1", "param2": 123},
     }
     sanitized = remote._sanitize_config(basic_config)
     assert sanitized["recursion_limit"] == 10
     assert sanitized["tags"] == ["tag1", "tag2"]
     assert sanitized["metadata"] == {
-        "str_key": "value",
-        "int_key": 42,
-        "bool_key": True,
+        "str_field": "value",
+        "int_field": 42,
+        "bool_field": True,
     }
     assert sanitized["configurable"] == {"param1": "value1", "param2": 123}
 
@@ -1208,7 +1208,7 @@ def test_sanitize_config():
         "tags": ["tag1", 123, {"obj": "tag"}, "tag2"],  # Only string tags should remain
         "metadata": {
             "nested": {
-                "key": "value",
+                "name": "value",
                 "num": 42,
                 "invalid": lambda x: x,
             },  # Last item should be removed
@@ -1220,7 +1220,7 @@ def test_sanitize_config():
     sanitized = remote._sanitize_config(complex_config)
     assert sanitized["tags"] == ["tag1", "tag2"]
     assert sanitized["metadata"] == {
-        "nested": {"key": "value", "num": 42},
+        "nested": {"name": "value", "num": 42},
         "list": [1, 2, "three"],
         "tuple": [1, 2, 3],
     }

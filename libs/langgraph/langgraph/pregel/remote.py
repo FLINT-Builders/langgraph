@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import urllib.parse
 from collections.abc import AsyncIterator, Iterator, Sequence
 from dataclasses import asdict
 from typing import (
@@ -43,7 +45,7 @@ from langgraph_sdk.schema import (
 )
 from typing_extensions import Self
 
-from langgraph._internal._config import merge_configs
+from langgraph._internal._config import _OMIT, merge_configs
 from langgraph._internal._constants import (
     CONF,
     CONFIG_KEY_CHECKPOINT_ID,
@@ -86,15 +88,28 @@ _CONF_DROPLIST = frozenset(
 
 _V3_SUPPORTED_KWARGS = frozenset({"metadata", "headers"})
 
+_BAGGAGE_METADATA = "langsmith-metadata"
+
+# Entries whose names look like credentials are never sent to the remote graph.
+_SENSITIVE_KEY_MARKERS = (*_OMIT, "credential", "passwd", "pwd", "cookie", "bearer")
+
+
+def _is_sensitive_key(key: str) -> bool:
+    key_lower = key.casefold()
+    return any(marker in key_lower for marker in _SENSITIVE_KEY_MARKERS)
+
 
 def _sanitize_config_value(v: Any) -> Any:
-    """Recursively sanitize a config value to ensure it contains only primitives."""
+    """Recursively sanitize a config value to ensure it contains only primitives.
+
+    Dict entries with credential-like names are dropped at every depth.
+    """
     if isinstance(v, (str, int, float, bool, UUID)):
         return v
     elif isinstance(v, dict):
         sanitized_dict = {}
         for k, val in v.items():
-            if isinstance(k, str):
+            if isinstance(k, str) and not _is_sensitive_key(k):
                 sanitized_value = _sanitize_config_value(val)
                 if sanitized_value is not None:
                     sanitized_dict[k] = sanitized_value
@@ -405,7 +420,7 @@ class RemoteGraph(PregelProtocol):
         }
 
     def _sanitize_config(self, config: RunnableConfig) -> RunnableConfig:
-        """Sanitize the config to remove non-serializable fields."""
+        """Sanitize the config to remove non-serializable and credential-like fields."""
         sanitized: RunnableConfig = {}
         if "recursion_limit" in config:
             sanitized["recursion_limit"] = config["recursion_limit"]
@@ -417,6 +432,7 @@ class RemoteGraph(PregelProtocol):
             for k, v in config["metadata"].items():
                 if (
                     isinstance(k, str)
+                    and not _is_sensitive_key(k)
                     and (sanitized_value := _sanitize_config_value(v)) is not None
                 ):
                     sanitized["metadata"][k] = sanitized_value
@@ -427,6 +443,7 @@ class RemoteGraph(PregelProtocol):
                 if (
                     isinstance(k, str)
                     and k not in _CONF_DROPLIST
+                    and not _is_sensitive_key(k)
                     and (sanitized_value := _sanitize_config_value(v)) is not None
                 ):
                     sanitized["configurable"][k] = sanitized_value
@@ -1294,9 +1311,35 @@ class RemoteGraph(PregelProtocol):
             return None
 
 
+def _redact_baggage_metadata(baggage: str) -> str:
+    """Drop credential-like entries from the LangSmith metadata in a baggage header."""
+    items = []
+    for item in baggage.split(","):
+        name, sep, value = item.partition("=")
+        if sep and name.strip() == _BAGGAGE_METADATA:
+            try:
+                metadata = json.loads(urllib.parse.unquote(value))
+            except ValueError:
+                continue
+            if not isinstance(metadata, dict):
+                continue
+            metadata = _sanitize_config_value(metadata)
+            if metadata:
+                items.append(
+                    f"{_BAGGAGE_METADATA}={urllib.parse.quote(json.dumps(metadata))}"
+                )
+        elif item:
+            items.append(item)
+    return ",".join(items)
+
+
 def _merge_tracing_headers(headers: dict[str, str] | None) -> dict[str, str] | None:
     if rt := ls.get_current_run_tree():
         tracing_headers = rt.to_headers()
+        if "baggage" in tracing_headers:
+            tracing_headers["baggage"] = _redact_baggage_metadata(
+                tracing_headers["baggage"]
+            )
         if headers:
             if "baggage" in headers:
                 tracing_headers["baggage"] = (
