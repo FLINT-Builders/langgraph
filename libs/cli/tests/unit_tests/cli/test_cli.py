@@ -143,13 +143,15 @@ services:
             additional_contexts:
                 - cli_1: {str(pathlib.Path(__file__).parent.parent.parent.parent.absolute())}
             dockerfile_inline: |
-                # syntax=docker/dockerfile:1.4
+                # syntax=docker/dockerfile:1.19
                 FROM langchain/langgraph-api:3.11
+                # BuildKit is required: the classic builder ignores ADD/COPY --exclude
+                RUN --network=default true
                 # -- Adding local package . --
-                ADD . /deps/cli
+                ADD --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env . /deps/cli
                 # -- End of local package . --
                 # -- Adding local package ../../.. --
-                COPY --from=cli_1 . /deps/cli_1
+                COPY --from=cli_1 --exclude=**/.env --exclude=**/.env.* --exclude=**/*.env . /deps/cli_1
                 # -- End of local package ../../.. --
                 # -- Installing all local dependencies --
                 RUN for dep in /deps/*; do             echo "Installing $$dep";             if [ -d "$$dep" ]; then                 echo "Installing $$dep";                 (cd "$$dep" && PYTHONDONTWRITEBYTECODE=1 uv pip install --system --no-cache-dir -c /api/constraints.txt -e .);             fi;         done
@@ -803,9 +805,9 @@ def test_dockerfile_command_with_base_image() -> None:
         assert save_path.exists()
         with open(save_path) as f:
             dockerfile = f.read()
-            assert re.match("FROM langchain/langgraph-server:0.2-py3.*", dockerfile), (
-                "\n".join(dockerfile.splitlines()[:3])
-            )
+            assert re.search(
+                "^FROM langchain/langgraph-server:0.2-py3.*", dockerfile, re.MULTILINE
+            ), "\n".join(dockerfile.splitlines()[:3])
 
 
 def test_dockerfile_command_with_docker_compose() -> None:
