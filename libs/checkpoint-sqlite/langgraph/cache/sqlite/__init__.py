@@ -9,6 +9,21 @@ from collections.abc import Mapping, Sequence
 from langgraph.cache.base import BaseCache, FullKey, Namespace, ValueT
 from langgraph.checkpoint.serde.base import SerializerProtocol
 
+# A lone "%" is never produced for a non-empty namespace, so it cannot collide
+# with `("",)`, which encodes to the empty string.
+_EMPTY_NS = "%"
+
+
+def _encode_ns(ns: Namespace) -> str:
+    """Encode a namespace tuple so that distinct tuples never share a string.
+
+    `%` and `,` inside a segment are percent-encoded before the segments are
+    joined with `,`, so every unescaped `,` is a segment separator.
+    """
+    if not ns:
+        return _EMPTY_NS
+    return ",".join(segment.replace("%", "%25").replace(",", "%2C") for segment in ns)
+
 
 class SqliteCache(BaseCache[ValueT]):
     """File-based cache using SQLite."""
@@ -51,8 +66,11 @@ class SqliteCache(BaseCache[ValueT]):
                 return {}
             placeholders = ",".join("(?, ?)" for _ in keys)
             params: list[str] = []
-            for ns_tuple, key in keys:
-                params.extend((",".join(ns_tuple), key))
+            requested: dict[tuple[str, str], FullKey] = {}
+            for full_key in keys:
+                ns_str = _encode_ns(full_key[0])
+                params.extend((ns_str, full_key[1]))
+                requested[(ns_str, full_key[1])] = full_key
             cursor = self._conn.execute(
                 f"SELECT ns, key, expiry, encoding, val FROM cache WHERE (ns, key) IN ({placeholders})",
                 tuple(params),
@@ -66,9 +84,10 @@ class SqliteCache(BaseCache[ValueT]):
                         "DELETE FROM cache WHERE (ns, key) = (?, ?)", (ns, key)
                     )
                     continue
-                values[(tuple(ns.split(",")), key)] = self.serde.loads_typed(
-                    (encoding, raw)
-                )
+                full_key = requested.get((ns, key))
+                if full_key is None:
+                    continue
+                values[full_key] = self.serde.loads_typed((encoding, raw))
             return values
 
     async def aget(self, keys: Sequence[FullKey]) -> dict[FullKey, ValueT]:
@@ -88,7 +107,7 @@ class SqliteCache(BaseCache[ValueT]):
                 encoding, raw = self.serde.dumps_typed(value)
                 self._conn.execute(
                     "INSERT OR REPLACE INTO cache (ns, key, expiry, encoding, val) VALUES (?, ?, ?, ?, ?)",
-                    (",".join(key[0]), key[1], expiry, encoding, raw),
+                    (_encode_ns(key[0]), key[1], expiry, encoding, raw),
                 )
 
     async def aset(self, mapping: Mapping[FullKey, tuple[ValueT, int | None]]) -> None:
@@ -105,7 +124,7 @@ class SqliteCache(BaseCache[ValueT]):
                 placeholders = ",".join("?" for _ in namespaces)
                 self._conn.execute(
                     f"DELETE FROM cache WHERE (ns) IN ({placeholders})",
-                    tuple(",".join(key) for key in namespaces),
+                    tuple(_encode_ns(ns) for ns in namespaces),
                 )
 
     async def aclear(self, namespaces: Sequence[Namespace] | None = None) -> None:

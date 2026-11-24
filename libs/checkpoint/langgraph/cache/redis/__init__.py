@@ -6,6 +6,39 @@ from typing import Any
 from langgraph.cache.base import BaseCache, FullKey, Namespace, ValueT
 from langgraph.checkpoint.serde.base import SerializerProtocol
 
+# `%` is the escape character, `:` separates segments, and the rest are Redis
+# glob metacharacters, so encoded parts can be matched literally by `KEYS`.
+_ESCAPES = {
+    "%": "%25",
+    ":": "%3A",
+    "*": "%2A",
+    "?": "%3F",
+    "[": "%5B",
+    "]": "%5D",
+    "\\": "%5C",
+}
+_UNESCAPES = {v: k for k, v in _ESCAPES.items()}
+_ESCAPE_TABLE = str.maketrans(_ESCAPES)
+_GLOB_ESCAPE_TABLE = str.maketrans({c: f"\\{c}" for c in "*?[]\\"})
+
+
+def _encode_part(part: str) -> str:
+    return part.translate(_ESCAPE_TABLE)
+
+
+def _decode_part(part: str) -> str:
+    out: list[str] = []
+    i = 0
+    while i < len(part):
+        token = part[i : i + 3]
+        if part[i] == "%" and token in _UNESCAPES:
+            out.append(_UNESCAPES[token])
+            i += 3
+        else:
+            out.append(part[i])
+            i += 1
+    return "".join(out)
+
 
 class RedisCache(BaseCache[ValueT]):
     """Redis-based cache implementation with TTL support."""
@@ -28,10 +61,17 @@ class RedisCache(BaseCache[ValueT]):
         self.redis = redis
         self.prefix = prefix
 
+    def _ns_prefix(self, ns: Namespace) -> str:
+        """Return the part of every Redis key in `ns` that precedes the entry key.
+
+        Each segment is encoded and followed by `:`, so distinct namespaces never
+        share a prefix of the same length.
+        """
+        return self.prefix + "".join(f"{_encode_part(segment)}:" for segment in ns)
+
     def _make_key(self, ns: Namespace, key: str) -> str:
         """Create a Redis key from namespace and key."""
-        ns_str = ":".join(ns) if ns else ""
-        return f"{self.prefix}{ns_str}:{key}" if ns_str else f"{self.prefix}{key}"
+        return self._ns_prefix(ns) + _encode_part(key)
 
     def _parse_key(self, redis_key: str) -> tuple[Namespace, str]:
         """Parse a Redis key back to namespace and key."""
@@ -40,14 +80,11 @@ class RedisCache(BaseCache[ValueT]):
                 f"Key {redis_key} does not start with prefix {self.prefix}"
             )
 
-        remaining = redis_key[len(self.prefix) :]
-        if ":" in remaining:
-            parts = remaining.split(":")
-            key = parts[-1]
-            ns_parts = parts[:-1]
-            return (tuple(ns_parts), key)
-        else:
-            return (tuple(), remaining)
+        parts = redis_key[len(self.prefix) :].split(":")
+        return (
+            tuple(_decode_part(part) for part in parts[:-1]),
+            _decode_part(parts[-1]),
+        )
 
     def get(self, keys: Sequence[FullKey]) -> dict[FullKey, ValueT]:
         """Get the cached values for the given keys."""
@@ -117,7 +154,7 @@ class RedisCache(BaseCache[ValueT]):
         try:
             if namespaces is None:
                 # Clear all keys with our prefix
-                pattern = f"{self.prefix}*"
+                pattern = f"{self.prefix.translate(_GLOB_ESCAPE_TABLE)}*"
                 keys = self.redis.keys(pattern)
                 if keys:
                     self.redis.delete(*keys)
@@ -125,12 +162,18 @@ class RedisCache(BaseCache[ValueT]):
                 # Clear specific namespaces
                 keys_to_delete = []
                 for ns in namespaces:
-                    ns_str = ":".join(ns) if ns else ""
-                    pattern = (
-                        f"{self.prefix}{ns_str}:*" if ns_str else f"{self.prefix}*"
-                    )
-                    keys = self.redis.keys(pattern)
-                    keys_to_delete.extend(keys)
+                    ns_prefix = self._ns_prefix(ns)
+                    ns_prefix_bytes = ns_prefix.encode()
+                    pattern = f"{ns_prefix.translate(_GLOB_ESCAPE_TABLE)}*"
+                    for redis_key in self.redis.keys(pattern):
+                        # The pattern also matches keys of nested namespaces;
+                        # an entry of `ns` itself has no `:` after its prefix.
+                        if isinstance(redis_key, bytes):
+                            rest_has_sep = b":" in redis_key[len(ns_prefix_bytes) :]
+                        else:
+                            rest_has_sep = ":" in redis_key[len(ns_prefix) :]
+                        if not rest_has_sep:
+                            keys_to_delete.append(redis_key)
 
                 if keys_to_delete:
                     self.redis.delete(*keys_to_delete)
