@@ -15,6 +15,7 @@ import pathspec
 from langgraph_cli._ignore import (
     _build_dockerignore_negation_hints,
     _build_ignore_spec,
+    _CredentialFileFilter,
     _is_always_excluded,
 )
 from langgraph_cli.schemas import Config
@@ -449,6 +450,7 @@ def _uv_lock_package_copy_items(
     package: UvLockPackage,
     plan: UvLockPlan,
     ignore_spec: pathspec.PathSpec,
+    credential_filter: _CredentialFileFilter = _CredentialFileFilter(),
 ) -> tuple[tuple[pathlib.PurePosixPath, pathlib.PurePosixPath], ...]:
     # Skip entries that .dockerignore / built-in exclusions would strip from
     # the build context. Emitting `ADD <path>` for a file that Docker has
@@ -489,6 +491,14 @@ def _uv_lock_package_copy_items(
             is_dir = child.is_dir()
             if _is_always_excluded(relative_child, is_dir=is_dir):
                 continue
+            if credential_filter.excludes_name(child.name):
+                continue
+            if not is_dir:
+                try:
+                    if credential_filter.excludes_stat(child.stat()):
+                        continue
+                except OSError:
+                    pass
             ignored = ignore_spec.match_file(
                 f"{relative_child.as_posix()}/" if is_dir else relative_child.as_posix()
             )
@@ -1009,11 +1019,12 @@ def python_config_to_docker_uv_lock(
     docker_plan.add_blank()
 
     ignore_spec = _build_ignore_spec(plan.project_root, include_gitignore=False)
+    credential_filter = _CredentialFileFilter.from_config(config_path, config)
     for package in plan.install_order:
         package_label = package.root.relative_to(plan.project_root).as_posix() or "."
         docker_plan.add_raw(f"# -- Adding workspace package {package_label} --")
         for source, destination in _uv_lock_package_copy_items(
-            package, plan, ignore_spec
+            package, plan, ignore_spec, credential_filter
         ):
             docker_plan.add_raw(copy_from_project_root(source, destination.as_posix()))
         docker_plan.add_instruction(

@@ -2,6 +2,7 @@
 
 import os
 import pathlib
+import stat
 import tarfile
 import tempfile
 from contextlib import contextmanager
@@ -9,7 +10,7 @@ from contextlib import contextmanager
 import click
 import pathspec
 
-from langgraph_cli._ignore import _build_ignore_spec
+from langgraph_cli._ignore import _build_ignore_spec, _CredentialFileFilter
 from langgraph_cli.config import Config, _assemble_local_deps
 
 _WARN_SIZE = 50 * 1024 * 1024  # 50 MB
@@ -25,27 +26,36 @@ def _tar_filter(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
     return tarinfo
 
 
+def _open_nofollow(path: str, flags: int) -> int:
+    return os.open(path, flags | getattr(os, "O_NOFOLLOW", 0))
+
+
 def _add_directory(
     tar: tarfile.TarFile,
     source_dir: pathlib.Path,
     arcname_prefix: str | None,
     ignore_spec: pathspec.PathSpec,
+    credential_filter: _CredentialFileFilter = _CredentialFileFilter(),
 ) -> None:
     """Recursively add a directory to the tarball under the given prefix.
 
     If arcname_prefix is None, files are added at the archive root.
-    Paths matching ignore_spec are excluded.
+    Paths matching ignore_spec are excluded. Env and credential files are
+    always excluded, regardless of ignore-file negations.
     """
     for root, dirs, files in os.walk(source_dir):
         rel_root = os.path.relpath(root, source_dir).replace(os.sep, "/")
         dirs[:] = [
             d
             for d in dirs
-            if not ignore_spec.match_file(
+            if not credential_filter.excludes_name(d)
+            and not ignore_spec.match_file(
                 f"{rel_root}/{d}/" if rel_root != "." else f"{d}/"
             )
         ]
         for f in files:
+            if credential_filter.excludes_name(f):
+                continue
             full_path = os.path.join(root, f)
             rel = os.path.relpath(full_path, source_dir).replace(os.sep, "/")
             if ignore_spec.match_file(rel):
@@ -55,7 +65,15 @@ def _add_directory(
             filtered = _tar_filter(info)
             if filtered is None:
                 continue
-            with open(full_path, "rb") as fobj:
+            try:
+                fobj = open(full_path, "rb", opener=_open_nofollow)
+            except OSError:
+                continue
+            with fobj:
+                st = os.fstat(fobj.fileno())
+                if not stat.S_ISREG(st.st_mode) or credential_filter.excludes_stat(st):
+                    continue
+                filtered.size = st.st_size
                 tar.addfile(filtered, fobj)
 
 
@@ -82,6 +100,7 @@ def create_archive(
 
     local_deps = _assemble_local_deps(config_path, config)
     extra_contexts = local_deps.additional_contexts or []
+    credential_filter = _CredentialFileFilter.from_config(config_path, config)
 
     dirs_to_include = [context_dir] + list(extra_contexts)
 
@@ -104,7 +123,11 @@ def create_archive(
                 added_dirs.add(key)
                 ignore_spec = _build_ignore_spec(dir_path)
                 _add_directory(
-                    tar, dir_path, arcname_prefix=prefix, ignore_spec=ignore_spec
+                    tar,
+                    dir_path,
+                    arcname_prefix=prefix,
+                    ignore_spec=ignore_spec,
+                    credential_filter=credential_filter,
                 )
 
         file_size = os.path.getsize(archive_path)

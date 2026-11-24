@@ -1,7 +1,11 @@
 """Shared ignore-file handling for local source filtering."""
 
+import fnmatch
+import os
 import pathlib
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 import pathspec
 
@@ -18,6 +22,49 @@ _ALWAYS_EXCLUDE_NAMES = frozenset(
     pattern.rstrip("/").split("/")[-1] for pattern in _ALWAYS_EXCLUDE
 )
 _GLOB_CHARS = frozenset("*?[")
+# Matched against the lowercased basename after ignore files are applied, so
+# `!` negations in `.gitignore` / `.dockerignore` cannot re-include them.
+_CREDENTIAL_NAME_PATTERNS = (".env", ".env.*", ".npmrc", ".netrc")
+
+
+def _is_credential_name(name: str) -> bool:
+    """Whether a file or directory basename is an env or credential file."""
+    lowered = name.lower()
+    return any(
+        fnmatch.fnmatchcase(lowered, pattern) for pattern in _CREDENTIAL_NAME_PATTERNS
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _CredentialFileFilter:
+    """Refuses env/credential files by name and the configured env file by inode.
+
+    The configured env file is identified once by `(st_dev, st_ino)`, so it is
+    still recognised under any name or through a hard link.
+    """
+
+    env_file_ids: frozenset[tuple[int, int]] = frozenset()
+
+    @classmethod
+    def from_config(
+        cls, config_path: pathlib.Path, config: Mapping[str, Any]
+    ) -> "_CredentialFileFilter":
+        ids: set[tuple[int, int]] = set()
+        env_field = config.get("env")
+        if isinstance(env_field, str) and env_field:
+            try:
+                st = os.stat(config_path.parent / env_field)
+            except OSError:
+                pass
+            else:
+                ids.add((st.st_dev, st.st_ino))
+        return cls(env_file_ids=frozenset(ids))
+
+    def excludes_name(self, name: str) -> bool:
+        return _is_credential_name(name)
+
+    def excludes_stat(self, st: os.stat_result) -> bool:
+        return (st.st_dev, st.st_ino) in self.env_file_ids
 
 
 @dataclass(frozen=True, slots=True)
