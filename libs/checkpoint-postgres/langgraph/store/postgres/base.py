@@ -25,6 +25,7 @@ from langgraph.store.base import (
     BaseStore,
     GetOp,
     IndexConfig,
+    InvalidNamespaceError,
     Item,
     ListNamespacesOp,
     Op,
@@ -1382,10 +1383,43 @@ def _row_to_search_item(
     )
 
 
+def _check_namespace_labels(labels: Sequence[str], namespace: Any) -> None:
+    """Reject labels that would make the dot-joined `prefix` ambiguous.
+
+    `prefix` stores a namespace as its labels joined by `.`, so a label that
+    contains `.` would address the row of a different, longer namespace.
+    """
+    for label in labels:
+        if not isinstance(label, str):
+            raise InvalidNamespaceError(
+                f"Invalid namespace label '{label}' found in {namespace}. Namespace"
+                f" labels must be strings, but got {type(label).__name__}."
+            )
+        if "." in label:
+            raise InvalidNamespaceError(
+                f"Invalid namespace label '{label}' found in {namespace}. Namespace labels cannot contain periods ('.')."
+            )
+
+
+def _validate_op_namespaces(op: Op) -> None:
+    """Validate an op's namespace before any query is built or run."""
+    if isinstance(op, (GetOp, PutOp)):
+        if not op.namespace:
+            # `()` and `("",)` would both be stored as the empty prefix.
+            raise InvalidNamespaceError("Namespace cannot be empty.")
+        _check_namespace_labels(op.namespace, op.namespace)
+    elif isinstance(op, SearchOp):
+        _check_namespace_labels(op.namespace_prefix, op.namespace_prefix)
+    elif isinstance(op, ListNamespacesOp):
+        for condition in op.match_conditions or ():
+            _check_namespace_labels(condition.path, condition.path)
+
+
 def _group_ops(ops: Iterable[Op]) -> tuple[dict[type, list[tuple[int, Op]]], int]:
     grouped_ops: dict[type, list[tuple[int, Op]]] = defaultdict(list)
     tot = 0
     for idx, op in enumerate(ops):
+        _validate_op_namespaces(op)
         grouped_ops[type(op)].append((idx, op))
         tot += 1
     return grouped_ops, tot
