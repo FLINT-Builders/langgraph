@@ -9,7 +9,7 @@ services:
       POSTGRES_PASSWORD: postgres
     command: ["postgres", "-c", "shared_preload_libraries=vector", "-c", "max_connections=150"]
     ports:
-      - "5443:5432"
+      - "127.0.0.1:5443:5432"
     healthcheck:
       test: pg_isready -U postgres
       interval: 5s
@@ -23,7 +23,7 @@ services:
     image: redis:7-alpine
     command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
     ports:
-      - "6380:6379"
+      - "127.0.0.1:6380:6379"
     healthcheck:
       test: redis-cli ping
       interval: 5s
