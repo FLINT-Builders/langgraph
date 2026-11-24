@@ -3279,6 +3279,7 @@ def test_config_to_compose_distributed_mode():
         validate_config({"dependencies": ["."], "graphs": graphs}),
         "langchain/langgraph-api",
         engine_runtime_mode="distributed",
+        postgres_uri="postgres://user:placeholder@db:5432/postgres",
     )
 
     # API service uses langchain/langgraph-api base image
@@ -3287,6 +3288,12 @@ def test_config_to_compose_distributed_mode():
     # Orchestrator service is present
     assert "langgraph-orchestrator:" in actual_compose_stdin
     assert "EXECUTOR_TARGET: langgraph-executor:8188" in actual_compose_stdin
+    assert (
+        actual_compose_stdin.count(
+            "DATABASE_URI: postgres://user:placeholder@db:5432/postgres"
+        )
+        == 2
+    )
 
     # Executor service is present with correct base image
     assert "langgraph-executor:" in actual_compose_stdin
@@ -3311,6 +3318,7 @@ def test_config_to_compose_distributed_mode_with_env_file():
         validate_config({"dependencies": ["."], "graphs": graphs, "env": ".env"}),
         "langchain/langgraph-api",
         engine_runtime_mode="distributed",
+        postgres_uri="postgres://user:placeholder@db:5432/postgres",
     )
 
     # env_file should appear multiple times: API, orchestrator, executor
@@ -3329,6 +3337,7 @@ def test_config_to_compose_distributed_mode_generates_two_dockerfiles():
         validate_config({"dependencies": ["."], "graphs": graphs}),
         "langchain/langgraph-api",
         engine_runtime_mode="distributed",
+        postgres_uri="postgres://user:placeholder@db:5432/postgres",
     )
 
     # Should contain two different FROM lines
@@ -3378,6 +3387,7 @@ def test_config_to_compose_distributed_executor_gets_correct_paths():
         validate_config({"dependencies": ["."], "graphs": graphs}),
         "langchain/langgraph-api",
         engine_runtime_mode="distributed",
+        postgres_uri="postgres://user:placeholder@db:5432/postgres",
     )
 
     # Both API and executor Dockerfiles should contain valid LANGSERVE_GRAPHS

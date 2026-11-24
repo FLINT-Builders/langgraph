@@ -1,10 +1,13 @@
+import json
+
 import pytest
 
 from langgraph_cli.docker import (
-    DEFAULT_POSTGRES_URI,
+    _BUNDLED_POSTGRES_HEALTHCHECK,
     DockerCapabilities,
     Version,
     _parse_version,
+    bundled_postgres_uri,
     compose,
 )
 from langgraph_cli.util import clean_empty_lines
@@ -14,6 +17,9 @@ DEFAULT_DOCKER_CAPABILITIES = DockerCapabilities(
     version_compose=Version(2, 27, 0),
     healthcheck_start_interval=False,
 )
+TEST_POSTGRES_PASSWORD = "test-postgres-password-placeholder"
+TEST_POSTGRES_URI = bundled_postgres_uri(TEST_POSTGRES_PASSWORD)
+POSTGRES_HEALTHCHECK = json.dumps(_BUNDLED_POSTGRES_HEALTHCHECK)
 
 
 def test_compose_with_no_debugger_and_custom_db():
@@ -105,7 +111,11 @@ def test_compose_with_debugger_and_custom_db():
 
 def test_compose_with_debugger_and_default_db():
     port = 8123
-    actual_compose_str = compose(DEFAULT_DOCKER_CAPABILITIES, port=port)
+    actual_compose_str = compose(
+        DEFAULT_DOCKER_CAPABILITIES,
+        port=port,
+        postgres_password=TEST_POSTGRES_PASSWORD,
+    )
     expected_compose_str = f"""volumes:
     langgraph-data:
         driver: local
@@ -119,12 +129,10 @@ services:
             retries: 5
     langgraph-postgres:
         image: pgvector/pgvector:pg16
-        ports:
-            - "5433:5432"
         environment:
             POSTGRES_DB: postgres
             POSTGRES_USER: postgres
-            POSTGRES_PASSWORD: postgres
+            POSTGRES_PASSWORD: "{TEST_POSTGRES_PASSWORD}"
         command:
             - postgres
             - -c
@@ -132,7 +140,7 @@ services:
         volumes:
             - langgraph-data:/var/lib/postgresql/data
         healthcheck:
-            test: pg_isready -U postgres
+            test: {POSTGRES_HEALTHCHECK}
             start_period: 10s
             timeout: 1s
             retries: 5
@@ -147,7 +155,7 @@ services:
                 condition: service_healthy
         environment:
             REDIS_URI: redis://langgraph-redis:6379
-            POSTGRES_URI: {DEFAULT_POSTGRES_URI}"""
+            POSTGRES_URI: {TEST_POSTGRES_URI}"""
     assert clean_empty_lines(actual_compose_str) == expected_compose_str
 
 
@@ -157,7 +165,10 @@ def test_compose_with_api_version():
     api_version = "0.2.74"
 
     actual_compose_str = compose(
-        DEFAULT_DOCKER_CAPABILITIES, port=port, api_version=api_version
+        DEFAULT_DOCKER_CAPABILITIES,
+        port=port,
+        postgres_password=TEST_POSTGRES_PASSWORD,
+        api_version=api_version,
     )
 
     # The compose function should generate a compose file that doesn't directly
@@ -176,12 +187,10 @@ services:
             retries: 5
     langgraph-postgres:
         image: pgvector/pgvector:pg16
-        ports:
-            - "5433:5432"
         environment:
             POSTGRES_DB: postgres
             POSTGRES_USER: postgres
-            POSTGRES_PASSWORD: postgres
+            POSTGRES_PASSWORD: "{TEST_POSTGRES_PASSWORD}"
         command:
             - postgres
             - -c
@@ -189,7 +198,7 @@ services:
         volumes:
             - langgraph-data:/var/lib/postgresql/data
         healthcheck:
-            test: pg_isready -U postgres
+            test: {POSTGRES_HEALTHCHECK}
             start_period: 10s
             timeout: 1s
             retries: 5
@@ -204,7 +213,7 @@ services:
                 condition: service_healthy
         environment:
             REDIS_URI: redis://langgraph-redis:6379
-            POSTGRES_URI: {DEFAULT_POSTGRES_URI}"""
+            POSTGRES_URI: {TEST_POSTGRES_URI}"""
     assert clean_empty_lines(actual_compose_str) == expected_compose_str
 
 
@@ -217,6 +226,7 @@ def test_compose_with_api_version_and_base_image():
     actual_compose_str = compose(
         DEFAULT_DOCKER_CAPABILITIES,
         port=port,
+        postgres_password=TEST_POSTGRES_PASSWORD,
         api_version=api_version,
         base_image=base_image,
     )
@@ -237,12 +247,10 @@ services:
             retries: 5
     langgraph-postgres:
         image: pgvector/pgvector:pg16
-        ports:
-            - "5433:5432"
         environment:
             POSTGRES_DB: postgres
             POSTGRES_USER: postgres
-            POSTGRES_PASSWORD: postgres
+            POSTGRES_PASSWORD: "{TEST_POSTGRES_PASSWORD}"
         command:
             - postgres
             - -c
@@ -250,7 +258,7 @@ services:
         volumes:
             - langgraph-data:/var/lib/postgresql/data
         healthcheck:
-            test: pg_isready -U postgres
+            test: {POSTGRES_HEALTHCHECK}
             start_period: 10s
             timeout: 1s
             retries: 5
@@ -265,7 +273,7 @@ services:
                 condition: service_healthy
         environment:
             REDIS_URI: redis://langgraph-redis:6379
-            POSTGRES_URI: {DEFAULT_POSTGRES_URI}"""
+            POSTGRES_URI: {TEST_POSTGRES_URI}"""
     assert clean_empty_lines(actual_compose_str) == expected_compose_str
 
 
@@ -311,6 +319,7 @@ def test_compose_with_api_version_and_debugger():
     actual_compose_str = compose(
         DEFAULT_DOCKER_CAPABILITIES,
         port=port,
+        postgres_password=TEST_POSTGRES_PASSWORD,
         api_version=api_version,
         debugger_port=debugger_port,
     )
@@ -328,12 +337,10 @@ services:
             retries: 5
     langgraph-postgres:
         image: pgvector/pgvector:pg16
-        ports:
-            - "5433:5432"
         environment:
             POSTGRES_DB: postgres
             POSTGRES_USER: postgres
-            POSTGRES_PASSWORD: postgres
+            POSTGRES_PASSWORD: "{TEST_POSTGRES_PASSWORD}"
         command:
             - postgres
             - -c
@@ -341,7 +348,7 @@ services:
         volumes:
             - langgraph-data:/var/lib/postgresql/data
         healthcheck:
-            test: pg_isready -U postgres
+            test: {POSTGRES_HEALTHCHECK}
             start_period: 10s
             timeout: 1s
             retries: 5
@@ -353,7 +360,7 @@ services:
             langgraph-postgres:
                 condition: service_healthy
         ports:
-            - "{debugger_port}:3968"
+            - "127.0.0.1:{debugger_port}:3968"
     langgraph-api:
         ports:
             - "{port}:8000"
@@ -364,7 +371,7 @@ services:
                 condition: service_healthy
         environment:
             REDIS_URI: redis://langgraph-redis:6379
-            POSTGRES_URI: {DEFAULT_POSTGRES_URI}"""
+            POSTGRES_URI: {TEST_POSTGRES_URI}"""
     assert clean_empty_lines(actual_compose_str) == expected_compose_str
 
 
