@@ -32,7 +32,7 @@ def test_compose_with_no_debugger_and_custom_db():
             retries: 5
     langgraph-api:
         ports:
-            - "{port}:8000"
+            - "127.0.0.1:{port}:8000"
         depends_on:
             langgraph-redis:
                 condition: service_healthy
@@ -60,7 +60,7 @@ def test_compose_with_no_debugger_and_custom_db_with_healthcheck():
             retries: 5
     langgraph-api:
         ports:
-            - "{port}:8000"
+            - "127.0.0.1:{port}:8000"
         depends_on:
             langgraph-redis:
                 condition: service_healthy
@@ -93,7 +93,7 @@ def test_compose_with_debugger_and_custom_db():
             retries: 5
     langgraph-api:
         ports:
-            - "{port}:8000"
+            - "127.0.0.1:{port}:8000"
         depends_on:
             langgraph-redis:
                 condition: service_healthy
@@ -120,7 +120,7 @@ services:
     langgraph-postgres:
         image: pgvector/pgvector:pg16
         ports:
-            - "5433:5432"
+            - "127.0.0.1:5433:5432"
         environment:
             POSTGRES_DB: postgres
             POSTGRES_USER: postgres
@@ -139,7 +139,7 @@ services:
             interval: 5s
     langgraph-api:
         ports:
-            - "{port}:8000"
+            - "127.0.0.1:{port}:8000"
         depends_on:
             langgraph-redis:
                 condition: service_healthy
@@ -177,7 +177,7 @@ services:
     langgraph-postgres:
         image: pgvector/pgvector:pg16
         ports:
-            - "5433:5432"
+            - "127.0.0.1:5433:5432"
         environment:
             POSTGRES_DB: postgres
             POSTGRES_USER: postgres
@@ -196,7 +196,7 @@ services:
             interval: 5s
     langgraph-api:
         ports:
-            - "{port}:8000"
+            - "127.0.0.1:{port}:8000"
         depends_on:
             langgraph-redis:
                 condition: service_healthy
@@ -238,7 +238,7 @@ services:
     langgraph-postgres:
         image: pgvector/pgvector:pg16
         ports:
-            - "5433:5432"
+            - "127.0.0.1:5433:5432"
         environment:
             POSTGRES_DB: postgres
             POSTGRES_USER: postgres
@@ -257,7 +257,7 @@ services:
             interval: 5s
     langgraph-api:
         ports:
-            - "{port}:8000"
+            - "127.0.0.1:{port}:8000"
         depends_on:
             langgraph-redis:
                 condition: service_healthy
@@ -292,7 +292,7 @@ def test_compose_with_api_version_and_custom_postgres():
             retries: 5
     langgraph-api:
         ports:
-            - "{port}:8000"
+            - "127.0.0.1:{port}:8000"
         depends_on:
             langgraph-redis:
                 condition: service_healthy
@@ -329,7 +329,7 @@ services:
     langgraph-postgres:
         image: pgvector/pgvector:pg16
         ports:
-            - "5433:5432"
+            - "127.0.0.1:5433:5432"
         environment:
             POSTGRES_DB: postgres
             POSTGRES_USER: postgres
@@ -353,10 +353,10 @@ services:
             langgraph-postgres:
                 condition: service_healthy
         ports:
-            - "{debugger_port}:3968"
+            - "127.0.0.1:{debugger_port}:3968"
     langgraph-api:
         ports:
-            - "{port}:8000"
+            - "127.0.0.1:{port}:8000"
         depends_on:
             langgraph-redis:
                 condition: service_healthy
@@ -388,7 +388,7 @@ def test_compose_distributed_mode_with_custom_db():
             retries: 5
     langgraph-api:
         ports:
-            - "{port}:8000"
+            - "127.0.0.1:{port}:8000"
         depends_on:
             langgraph-redis:
                 condition: service_healthy
