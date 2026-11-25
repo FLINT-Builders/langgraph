@@ -323,6 +323,25 @@ def _dedupe_ops(values: list[Op]) -> tuple[list[int] | None, list[Op]]:
     return listen, dedupped
 
 
+async def _run_individually(
+    store: BaseStore,
+    futs: list[asyncio.Future],
+    values: list[Op],
+) -> None:
+    for fut, op in zip(futs, values, strict=True):
+        # guard against future being done (e.g. cancelled)
+        if fut.done():
+            continue
+        try:
+            result = (await store.abatch([op]))[0]
+        except Exception as e:
+            if not fut.done():
+                fut.set_exception(e)
+        else:
+            if not fut.done():
+                fut.set_result(result)
+
+
 async def _run(
     aqueue: asyncio.Queue[tuple[asyncio.Future, Op]],
     store: weakref.ReferenceType[BaseStore],
@@ -360,10 +379,16 @@ async def _run(
                         if not fut.done():
                             fut.set_result(result)
                 except Exception as e:
-                    for fut in futs:
-                        # guard against future being done (e.g. cancelled)
-                        if not fut.done():
-                            fut.set_exception(e)
+                    if len(items) == 1:
+                        if not futs[0].done():
+                            futs[0].set_exception(e)
+                    else:
+                        # The batch mixes ops from independent callers, so one
+                        # op's failure must not be reported to (or drop the
+                        # writes of) the others. Rerun each op on its own, in
+                        # submission order so puts to the same key keep
+                        # last-writer-wins semantics.
+                        await _run_individually(s, futs, values)
             finally:
                 # remove strong ref to store
                 del s
