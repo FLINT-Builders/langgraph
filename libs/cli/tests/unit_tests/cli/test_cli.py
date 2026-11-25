@@ -6,8 +6,10 @@ import tempfile
 import textwrap
 from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 import click
+import pytest
 from click.testing import CliRunner
 
 import langgraph_cli.deploy as deploy_module
@@ -68,6 +70,7 @@ def test_prepare_args_and_stdin() -> None:
         debugger_port=debugger_port,
         debugger_base_url=debugger_graph_url,
         watch=True,
+        workspace_root=config_path.parents[3],
     )
 
     expected_args = [
@@ -331,6 +334,49 @@ def test_deploy_missing_config_shows_actionable_error(tmp_path, monkeypatch) -> 
     assert "Run `langgraph deploy` from the root" in result.output
     assert "https://docs.langchain.com/langsmith/deployment-quickstart" in result.output
     assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize("pass_workspace_root", [True, False])
+def test_deploy_remote_build_receives_workspace_root(
+    tmp_path, monkeypatch, pass_workspace_root
+) -> None:
+    repo = tmp_path / "repo"
+    project = repo / "apps" / "agent"
+    project.mkdir(parents=True)
+    (project / "agent.py").write_text("graph = object()\n")
+    config_path = project / "langgraph.json"
+    config_path.write_text(
+        json.dumps(
+            {"dependencies": ["."], "graphs": {"agent": "./agent.py:graph"}, "env": {}}
+        )
+    )
+    captured: dict[str, object] = {}
+
+    def fake_remote_build(**kwargs):
+        captured.update(kwargs)
+        raise click.ClickException("stop after build dispatch")
+
+    monkeypatch.setattr(
+        deploy_module, "_resolve_build_mode", lambda *_a, **_k: (True, None)
+    )
+    monkeypatch.setattr(
+        deploy_module, "_create_host_backend_client", lambda *_a, **_k: object()
+    )
+    monkeypatch.setattr(
+        deploy_module,
+        "_resolve_deployment",
+        lambda *_a, **_k: ("dep-123", False, 1),
+    )
+    monkeypatch.setattr(deploy_module, "_run_remote_build", fake_remote_build)
+
+    args = ["deploy", "--config", str(config_path), "--name", "agent", "--no-input"]
+    if pass_workspace_root:
+        args += ["--workspace-root", str(repo)]
+    result = CliRunner().invoke(cli, args)
+
+    assert "stop after build dispatch" in result.output, result.output
+    expected = repo.resolve() if pass_workspace_root else None
+    assert captured["workspace_root"] == expected
 
 
 def test_deploy_missing_config_emits_json_error(tmp_path, monkeypatch) -> None:
@@ -988,6 +1034,8 @@ def test_build_generate_proper_build_context():
                     "test-image",
                     "--config",
                     str(temp_dir / "config.json"),
+                    "--workspace-root",
+                    str(temp_dir.parents[2]),
                 ],
                 catch_exceptions=True,
             )
@@ -998,6 +1046,69 @@ def test_build_generate_proper_build_context():
         assert len(build_contexts) == 2, (
             f"Expected 2 build contexts, but found {len(build_contexts)}"
         )
+
+
+def test_build_rejects_dependency_outside_project_without_workspace_root():
+    runner = CliRunner()
+    config_content = {
+        "python_version": "3.11",
+        "graphs": {"agent": "agent.py:graph"},
+        "dependencies": [".", "../.."],
+        "image_distro": "wolfi",
+    }
+
+    with temporary_config_folder(config_content, levels=3) as temp_dir:
+        (temp_dir / "agent.py").touch()
+        with (
+            runner.isolated_filesystem(),
+            patch("langgraph_cli.docker.subp_exec") as mock_exec,
+            patch("langgraph_cli.cli.shutil.which", return_value="/usr/bin/docker"),
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "build",
+                    "--tag",
+                    "test-image",
+                    "--config",
+                    str(temp_dir / "config.json"),
+                ],
+            )
+
+        assert result.exit_code == 2, result.output
+        assert "outside the project directory" in result.output
+        assert "--workspace-root" in result.output
+        mock_exec.assert_not_called()
+
+
+def test_dockerfile_rejects_workspace_root_that_does_not_contain_config():
+    runner = CliRunner()
+    config_content = {
+        "python_version": "3.11",
+        "graphs": {"agent": "agent.py:graph"},
+        "dependencies": ["."],
+    }
+
+    with (
+        temporary_config_folder(config_content, levels=1) as temp_dir,
+        tempfile.TemporaryDirectory() as unrelated,
+    ):
+        (temp_dir / "agent.py").touch()
+        result = runner.invoke(
+            cli,
+            [
+                "dockerfile",
+                str(temp_dir / "Dockerfile"),
+                "--config",
+                str(temp_dir / "config.json"),
+                "--workspace-root",
+                unrelated,
+            ],
+        )
+
+        assert result.exit_code == 2, result.output
+        assert "must contain the directory" in result.output
+        assert not (temp_dir / "Dockerfile").exists()
 
 
 def test_dockerfile_command_with_api_version() -> None:

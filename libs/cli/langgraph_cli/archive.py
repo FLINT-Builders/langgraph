@@ -63,11 +63,14 @@ def _add_directory(
 def create_archive(
     config_path: pathlib.Path,
     config: Config,
+    *,
+    workspace_root: str | os.PathLike[str] | None = None,
 ):
     """Context manager that creates a .tar.gz archive of the project source.
 
     Uses _assemble_local_deps to discover local dependencies referenced in
-    langgraph.json, including those outside config.parent (monorepo case).
+    langgraph.json. Dependencies outside config.parent (monorepo case) are only
+    included when they lie beneath `workspace_root`.
 
     The archive preserves the real filesystem layout relative to the common
     ancestor of config.parent and all external dependency directories, so that
@@ -80,7 +83,9 @@ def create_archive(
     config_path = config_path.resolve()
     context_dir = config_path.parent
 
-    local_deps = _assemble_local_deps(config_path, config)
+    local_deps = _assemble_local_deps(
+        config_path, config, workspace_root=workspace_root
+    )
     extra_contexts = local_deps.additional_contexts or []
 
     dirs_to_include = [context_dir] + list(extra_contexts)
