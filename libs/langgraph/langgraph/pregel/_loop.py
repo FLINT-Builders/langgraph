@@ -116,6 +116,7 @@ from langgraph.pregel._io import (
     map_output_updates,
     map_output_values,
     read_channels,
+    reject_json_overwrite,
 )
 from langgraph.pregel._messages import ensure_message_ids
 from langgraph.pregel._read import PregelNode
@@ -926,6 +927,8 @@ class PregelLoop:
                     writes[tid].append((c, v))
             if not writes and not resume_is_map:
                 raise EmptyInputError("Received empty Command input")
+            for ws in writes.values():
+                reject_json_overwrite(self.channels, ws)
             # save writes
             for tid, ws in writes.items():
                 self.put_writes(tid, ws)
@@ -975,6 +978,7 @@ class PregelLoop:
             )
         # map inputs to channel updates
         elif input_writes := deque(map_input(input_keys, self.input)):
+            reject_json_overwrite(self.channels, input_writes)
             # discard any unfinished tasks from previous checkpoint
             discard_tasks = prepare_next_tasks(
                 self.checkpoint,

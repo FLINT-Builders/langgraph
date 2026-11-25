@@ -137,7 +137,7 @@ from langgraph.pregel._checkpoint import (
     get_updated_channels_from_tasks,
 )
 from langgraph.pregel._draw import draw_graph
-from langgraph.pregel._io import map_input, read_channels
+from langgraph.pregel._io import map_input, read_channels, reject_json_overwrite
 from langgraph.pregel._loop import (
     AsyncPregelLoop,
     SyncPregelLoop,
@@ -1751,6 +1751,7 @@ class Pregel(
                     )
 
                 if input_writes := deque(map_input(self.input_channels, values)):
+                    reject_json_overwrite(channels, input_writes)
                     apply_writes(
                         checkpoint,
                         channels,
@@ -1997,6 +1998,8 @@ class Pregel(
                         },
                     ),
                 )
+            for task in run_tasks:
+                reject_json_overwrite(channels, task.writes)
             updated_channels = get_updated_channels_from_tasks(run_tasks)
             if saved is not None:
                 for task_id, task in zip(run_task_ids, run_tasks):
@@ -2214,6 +2217,7 @@ class Pregel(
                     )
 
                 if input_writes := deque(map_input(self.input_channels, values)):
+                    reject_json_overwrite(channels, input_writes)
                     apply_writes(
                         checkpoint,
                         channels,
@@ -2457,6 +2461,8 @@ class Pregel(
                         },
                     ),
                 )
+            for task in run_tasks:
+                reject_json_overwrite(channels, task.writes)
             updated_channels = get_updated_channels_from_tasks(run_tasks)
             if saved is not None:
                 for task_id, task in zip(run_task_ids, run_tasks):

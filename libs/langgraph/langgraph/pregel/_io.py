@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Any, Literal
 
 from langgraph._internal._constants import (
@@ -14,6 +14,8 @@ from langgraph._internal._constants import (
 )
 from langgraph._internal._typing import EMPTY_SEQ, MISSING
 from langgraph.channels.base import BaseChannel, EmptyChannelError
+from langgraph.channels.binop import BinaryOperatorAggregate, _is_json_overwrite
+from langgraph.channels.delta import DeltaChannel
 from langgraph.constants import START, TAG_HIDDEN
 from langgraph.errors import InvalidUpdateError
 from langgraph.pregel._log import logger
@@ -51,6 +53,26 @@ def read_channels(
             except EmptyChannelError:
                 pass
         return values
+
+
+def reject_json_overwrite(
+    channels: Mapping[str, Any], writes: Iterable[tuple[str, Any]]
+) -> None:
+    """Refuse caller-supplied writes that carry a plain-dict overwrite marker.
+
+    Graph input, `Command` input and `update_state` values can originate from
+    untrusted JSON, so only a typed `Overwrite` instance may bypass a reducer
+    there. The dict forms remain accepted on writes produced by graph nodes.
+    """
+    for chan, value in writes:
+        if isinstance(
+            channels.get(chan), (BinaryOperatorAggregate, DeltaChannel)
+        ) and _is_json_overwrite(value):
+            raise InvalidUpdateError(
+                f"Received a dict overwrite marker for channel '{chan}' in "
+                "caller-supplied input. Use `langgraph.types.Overwrite` to "
+                "replace a reducer channel's value."
+            )
 
 
 def map_command(cmd: Command) -> Iterator[tuple[str, str, Any]]:
