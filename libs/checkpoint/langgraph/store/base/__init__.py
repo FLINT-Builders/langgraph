@@ -702,6 +702,16 @@ class IndexConfig(TypedDict, total=False):
         - Fields missing from a document are skipped
         - Array notation creates separate embeddings for each element
         - Complex nested paths are supported (e.g., `"a.b[*].c.d"`)
+        - At most `max_texts_per_put` texts are embedded for a single item
+    """
+
+    max_texts_per_put: int
+    """Maximum number of texts embedded for a single `put` (default `32`).
+
+    The limit is shared by every field path used for the item, whether it comes
+    from `fields` or from the `index` argument of `put`. Wildcard paths such as
+    `"items[*]"` can match an arbitrary number of values; matches beyond the
+    limit are not embedded, and a warning is logged.
     """
 
 

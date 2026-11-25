@@ -376,6 +376,7 @@ class BasePostgresStore(Generic[C]):
 
             # Then handle embeddings if configured
             if self.index_config:
+                max_texts = _get_max_texts_per_put(self.index_config)
                 for op in inserts:
                     if op.index is False:
                         continue
@@ -388,14 +389,29 @@ class BasePostgresStore(Generic[C]):
                     else:
                         paths = [(ix, tokenize_path(ix)) for ix in op.index]
 
+                    remaining = max_texts
                     for path, tokenized_path in paths:
                         texts = get_text_at_path(value, tokenized_path)
+                        if not texts:
+                            continue
+                        multiple = len(texts) > 1
+                        truncated = len(texts) > remaining
+                        if truncated:
+                            texts = texts[:remaining]
+                        remaining -= len(texts)
                         for i, text in enumerate(texts):
-                            pathname = f"{path}.{i}" if len(texts) > 1 else path
+                            pathname = f"{path}.{i}" if multiple else path
                             vector_values.append(
                                 "(%s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
                             )
                             embedding_request_params.append((ns, k, pathname, text))
+                        if truncated:
+                            logger.warning(
+                                "Embedding at most %d texts for a single put; "
+                                "remaining matches were not indexed.",
+                                max_texts,
+                            )
+                            break
 
             values_str = ",".join(values)
             query = f"""
@@ -1471,10 +1487,23 @@ def _ensure_index_config(
             tot += len(toks)
     index_config["__tokenized_fields"] = tokenized
     index_config["__estimated_num_vectors"] = tot
+    index_config["max_texts_per_put"] = _get_max_texts_per_put(index_config)
     embeddings = ensure_embeddings(
         index_config.get("embed"),
     )
     return embeddings, index_config
+
+
+DEFAULT_MAX_TEXTS_PER_PUT = 32
+
+
+def _get_max_texts_per_put(index_config: Mapping[str, Any]) -> int:
+    value = index_config.get("max_texts_per_put")
+    if value is None:
+        return DEFAULT_MAX_TEXTS_PER_PUT
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"max_texts_per_put must be a positive integer. Got {value!r}")
+    return value
 
 
 PLACEHOLDER = object()
