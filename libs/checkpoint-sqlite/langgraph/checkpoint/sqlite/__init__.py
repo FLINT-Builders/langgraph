@@ -24,10 +24,12 @@ from langgraph.checkpoint.base import (
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from langgraph.checkpoint.sqlite._delta import (
+    DELTA_CHECKPOINT_BLOB_SQL,
+    DELTA_PAGE_SIZE,
     DELTA_STAGE1_SQL,
+    DeltaAncestorWalk,
     build_delta_channels_writes_history,
-    build_delta_stage2_sql,
-    step_walk_with_row,
+    iter_delta_stage2_queries,
 )
 from langgraph.checkpoint.sqlite.utils import search_where
 
@@ -507,18 +509,19 @@ class SqliteSaver(BaseCheckpointSaver[str]):
 
         Two-stage query:
 
-        * Stage 1 (paged): newest-first slice of `checkpoints` returning
-          `(checkpoint_id, parent_checkpoint_id, type, checkpoint)` per
-          ancestor. Sqlite has no JSONB, so we ship the full serialized
-          checkpoint blob and inspect `channel_values` in Python. Pages
-          newest-first by `checkpoint_id` with a `< cursor` predicate;
-          page size is `DELTA_PAGE_SIZE`. Stops paging when every channel
-          has found its seed or the chain is exhausted.
+        * Stage 1 (paged): newest-first slices of `checkpoints` returning
+          `(checkpoint_id, parent_checkpoint_id)` from the cid the walk
+          needs next. Sqlite has no JSONB, so the serialized checkpoint is
+          loaded by primary key, only for ancestors, and `channel_values`
+          is inspected in Python. At most `DELTA_PAGE_SIZE` rows are read
+          per saver-lock hold. Stops when every channel has found its seed
+          or the chain is exhausted.
 
         * Stage 2 (per-channel UNION ALL): one branch per channel reading
-          `writes` filtered to that channel's specific `chain_cids`. No
-          separate seed-blob fetch — sqlite stores `channel_values` inline
-          in the checkpoint blob, so seeds come back from stage 1.
+          `writes` filtered to that channel's specific `chain_cids`, split
+          into statements that stay under sqlite's bound-parameter limit.
+          No separate seed-blob fetch — sqlite stores `channel_values`
+          inline in the checkpoint blob, so seeds come back from stage 1.
         """
         if not channels:
             return {}
@@ -532,52 +535,57 @@ class SqliteSaver(BaseCheckpointSaver[str]):
                 return {ch: {"writes": []} for ch in channels}
             checkpoint_id = target.config["configurable"]["checkpoint_id"]
 
-        chain_by_ch: dict[str, list[str]] = {ch: [] for ch in channels}
-        seed_val_by_ch: dict[str, Any] = {}
-        walk_state: dict[str, Any] = {}
-        seeded: set[str] = set()
+        walk = DeltaAncestorWalk(
+            thread_id=thread_id,
+            checkpoint_ns=checkpoint_ns,
+            target_id=checkpoint_id,
+            channels=channels,
+            serde=self.serde,
+        )
+        # The saver lock is released between holds so other threads sharing
+        # this saver can run while a long history is read.
+        while not walk.done:
+            with (
+                self.cursor(transaction=False) as cur,
+                closing(self.conn.cursor()) as blob_cur,
+            ):
+                budget = DELTA_PAGE_SIZE
+                while budget > 0 and not walk.done:
+                    cur.execute(DELTA_STAGE1_SQL, walk.stage1_params(budget))
+                    rows = 0
+                    stopped = False
+                    for cid, parent_cid in cur:
+                        rows += 1
+                        keep = walk.accept_row(cid, parent_cid)
+                        if walk.pending_cid is not None:
+                            blob_cur.execute(
+                                DELTA_CHECKPOINT_BLOB_SQL, walk.blob_params()
+                            )
+                            blob_rows = blob_cur.fetchall()
+                            walk.visit(blob_rows[0] if blob_rows else None)
+                        if not keep or walk.done:
+                            stopped = True
+                            break
+                    if not stopped and rows < budget:
+                        walk.end_page()
+                    budget -= rows
 
-        with self.cursor(transaction=False) as cur:
-            cur.execute(DELTA_STAGE1_SQL, (thread_id, checkpoint_ns, checkpoint_id))
-            for row in cur:
-                cid, parent_cid, type_tag, blob = row
-                if step_walk_with_row(
-                    cid=cid,
-                    parent_cid=parent_cid,
-                    type_tag=type_tag,
-                    blob=blob,
-                    target_id=checkpoint_id,
-                    serde=self.serde,
-                    chain_by_ch=chain_by_ch,
-                    seed_val_by_ch=seed_val_by_ch,
-                    walk_state=walk_state,
-                    seeded=seeded,
-                    channels=channels,
-                ):
-                    break
-
-            channels_with_chain = [ch for ch in channels if chain_by_ch[ch]]
-            stage2_sql = build_delta_stage2_sql(
-                chain_lens=[len(chain_by_ch[ch]) for ch in channels_with_chain],
-            )
-            if stage2_sql:
-                stage2_params: list[Any] = []
-                for ch in channels_with_chain:
-                    stage2_params.extend(
-                        [thread_id, checkpoint_ns, ch, *chain_by_ch[ch]]
-                    )
+        stage2_rows: list[tuple[str, str, str, int, str, bytes]] = []
+        for stage2_sql, stage2_params in iter_delta_stage2_queries(
+            thread_id=thread_id,
+            checkpoint_ns=checkpoint_ns,
+            channels=channels,
+            chain_by_ch=walk.chain_by_ch,
+        ):
+            with self.cursor(transaction=False) as cur:
                 cur.execute(stage2_sql, stage2_params)
-                stage2_rows = cast(
-                    "list[tuple[str, str, str, int, str, bytes]]", cur.fetchall()
-                )
-            else:
-                stage2_rows = []
+                stage2_rows.extend(cur.fetchall())
 
         return build_delta_channels_writes_history(
             channels=channels,
-            chain_by_ch=chain_by_ch,
-            seed_val_by_ch=seed_val_by_ch,
-            seeded=seeded,
+            chain_by_ch=walk.chain_by_ch,
+            seed_val_by_ch=walk.seed_val_by_ch,
+            seeded=walk.seeded,
             stage2_rows=stage2_rows,
             serde=self.serde,
         )
