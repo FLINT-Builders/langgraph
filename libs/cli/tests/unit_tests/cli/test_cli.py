@@ -92,7 +92,7 @@ services:
     langgraph-postgres:
         image: pgvector/pgvector:pg16
         ports:
-            - "5433:5432"
+            - "127.0.0.1:5433:5432"
         environment:
             POSTGRES_DB: postgres
             POSTGRES_USER: postgres
@@ -117,12 +117,12 @@ services:
             langgraph-postgres:
                 condition: service_healthy
         ports:
-            - "{debugger_port}:3968"
+            - "127.0.0.1:{debugger_port}:3968"
         environment:
             VITE_STUDIO_LOCAL_GRAPH_URL: {debugger_graph_url}
     langgraph-api:
         ports:
-            - "8000:8000"
+            - "127.0.0.1:8000:8000"
         depends_on:
             langgraph-redis:
                 condition: service_healthy
@@ -215,7 +215,7 @@ services:
     langgraph-postgres:
         image: pgvector/pgvector:pg16
         ports:
-            - "5433:5432"
+            - "127.0.0.1:5433:5432"
         environment:
             POSTGRES_DB: postgres
             POSTGRES_USER: postgres
@@ -240,12 +240,12 @@ services:
             langgraph-postgres:
                 condition: service_healthy
         ports:
-            - "{debugger_port}:3968"
+            - "127.0.0.1:{debugger_port}:3968"
         environment:
             VITE_STUDIO_LOCAL_GRAPH_URL: {debugger_graph_url}
     langgraph-api:
         ports:
-            - "8000:8000"
+            - "127.0.0.1:8000:8000"
         depends_on:
             langgraph-redis:
                 condition: service_healthy

@@ -114,6 +114,29 @@ OPT_PORT = click.option(
     \b
     """,
 )
+
+
+def _validate_up_host(ctx: click.Context, param: click.Parameter, value: str) -> str:
+    langgraph_cli.docker.parse_host(value)
+    return value
+
+
+def _default_api_base_url(host: str, port: int) -> str:
+    address = langgraph_cli.docker.parse_host(host)
+    if address.is_loopback or address.is_unspecified:
+        return f"http://127.0.0.1:{port}"
+    return f"http://{langgraph_cli.docker.format_host(host)}:{port}"
+
+
+OPT_UP_HOST = click.option(
+    "--host",
+    default=langgraph_cli.docker.DEFAULT_HOST,
+    show_default=True,
+    callback=_validate_up_host,
+    help="Host IP address that the API, debugger and bundled Postgres ports are "
+    "published on. Default 127.0.0.1 is recommended for security. Only use "
+    "0.0.0.0 in trusted networks",
+)
 OPT_RECREATE = click.option(
     "--recreate/--no-recreate",
     default=False,
@@ -245,6 +268,7 @@ cli.add_command(deploy)
 @OPT_RECREATE
 @OPT_PULL
 @OPT_PORT
+@OPT_UP_HOST
 @OPT_DOCKER_COMPOSE
 @OPT_CONFIG
 @OPT_VERBOSE
@@ -279,6 +303,7 @@ def up(
     config: pathlib.Path,
     docker_compose: pathlib.Path | None,
     port: int,
+    host: str,
     recreate: bool,
     pull: bool,
     watch: bool,
@@ -297,6 +322,17 @@ def up(
         """For local dev, requires env var LANGSMITH_API_KEY with access to LangSmith Deployment.
 For production use, requires a license key in env var LANGGRAPH_CLOUD_LICENSE_KEY.""",
     )
+    if langgraph_cli.docker.is_loopback_host(host):
+        display_host = "localhost"
+    else:
+        display_host = langgraph_cli.docker.format_host(host)
+        click.secho(
+            f"Warning: --host {host} publishes the LangGraph API, debugger and "
+            "bundled Postgres ports beyond this machine, and binding to 0.0.0.0 "
+            "exposes it on every network interface. Only use a non-loopback "
+            "address in trusted networks.",
+            fg="yellow",
+        )
     with Runner() as runner, Progress(message="Pulling...") as set:
         capabilities = langgraph_cli.docker.check_capabilities(runner)
         args, stdin = prepare(
@@ -305,6 +341,7 @@ For production use, requires a license key in env var LANGGRAPH_CLOUD_LICENSE_KE
             config_path=config,
             docker_compose=docker_compose,
             port=port,
+            host=host,
             pull=pull,
             watch=watch,
             verbose=verbose,
@@ -338,18 +375,18 @@ For production use, requires a license key in env var LANGGRAPH_CLOUD_LICENSE_KE
                 set("Starting...")
             elif "Application startup complete" in line:
                 debugger_origin = (
-                    f"http://localhost:{debugger_port}"
+                    f"http://{display_host}:{debugger_port}"
                     if debugger_port
                     else "https://smith.langchain.com"
                 )
-                debugger_base_url_query = (
-                    debugger_base_url or f"http://127.0.0.1:{port}"
+                debugger_base_url_query = debugger_base_url or _default_api_base_url(
+                    host, port
                 )
                 set("")
                 sys.stdout.write(
                     f"""Ready!
-- API: http://localhost:{port}
-- Docs: http://localhost:{port}/docs
+- API: http://{display_host}:{port}
+- Docs: http://{display_host}:{port}/docs
 - LangGraph Studio: {debugger_origin}/studio/?baseUrl={debugger_base_url_query}
 """
                 )
@@ -944,12 +981,14 @@ def prepare_args_and_stdin(
     image: str | None = None,
     # Like "langchain/langgraphjs-api" or "langchain/langgraph-api
     base_image: str | None = None,
+    host: str = langgraph_cli.docker.DEFAULT_HOST,
 ) -> tuple[list[str], str]:
     assert config_path.exists(), f"Config file not found: {config_path}"
     # prepare args
     stdin = langgraph_cli.docker.compose(
         capabilities,
         port=port,
+        host=host,
         debugger_port=debugger_port,
         debugger_base_url=debugger_base_url,
         postgres_uri=postgres_uri,
@@ -996,6 +1035,7 @@ def prepare(
     engine_runtime_mode: str = "combined_queue_worker",
     image: str | None = None,
     base_image: str | None = None,
+    host: str = langgraph_cli.docker.DEFAULT_HOST,
 ) -> tuple[list[str], str]:
     """Prepare the arguments and stdin for running the LangGraph API server."""
     config_json = langgraph_cli.config.validate_config_file(config_path)
@@ -1031,9 +1071,10 @@ def prepare(
         config=config_json,
         docker_compose=docker_compose,
         port=port,
+        host=host,
         watch=watch,
         debugger_port=debugger_port,
-        debugger_base_url=debugger_base_url or f"http://127.0.0.1:{port}",
+        debugger_base_url=debugger_base_url or _default_api_base_url(host, port),
         postgres_uri=postgres_uri,
         api_version=api_version,
         engine_runtime_mode=engine_runtime_mode,

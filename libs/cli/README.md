@@ -59,6 +59,7 @@ Launch LangGraph API server in Docker.
 ```bash
 langgraph up [OPTIONS]
   -p, --port INTEGER        Port to expose (default: 8123)
+  --host TEXT               Host IP to publish ports on (default: 127.0.0.1)
   --wait                   Wait for services to start
   --watch                  Restart on file changes
   --verbose               Show detailed logs

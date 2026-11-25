@@ -1,4 +1,5 @@
 import copy
+import ipaddress
 import json
 import pathlib
 import platform
@@ -15,6 +16,38 @@ ROOT = pathlib.Path(__file__).parent.resolve()
 DEFAULT_POSTGRES_URI = (
     "postgres://postgres:postgres@langgraph-postgres:5432/postgres?sslmode=disable"
 )
+DEFAULT_HOST = "127.0.0.1"
+
+
+def parse_host(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    """Parse a host address for published ports.
+
+    Docker Compose only accepts an IP address as the host part of a published
+    port, so hostnames are rejected rather than passed through.
+    """
+    try:
+        return ipaddress.ip_address(host.strip().removeprefix("[").removesuffix("]"))
+    except ValueError:
+        raise click.BadParameter(
+            f"{host!r} is not an IP address. Use an address such as "
+            f"{DEFAULT_HOST} (this machine only) or 0.0.0.0 (all interfaces)."
+        ) from None
+
+
+def is_loopback_host(host: str) -> bool:
+    return parse_host(host).is_loopback
+
+
+def format_host(host: str) -> str:
+    """Return `host` in the form used in URLs and Compose port mappings."""
+    address = parse_host(host)
+    if address.version == 6:
+        return f"[{address.compressed}]"
+    return address.compressed
+
+
+def _published_port(host: str, host_port: int, container_port: int) -> str:
+    return f'"{format_host(host)}:{int(host_port)}:{int(container_port)}"'
 
 
 class Version(NamedTuple):
@@ -142,7 +175,12 @@ def check_capabilities(runner) -> DockerCapabilities:
     )
 
 
-def debugger_compose(*, port: int | None = None, base_url: str | None = None) -> dict:
+def debugger_compose(
+    *,
+    port: int | None = None,
+    base_url: str | None = None,
+    host: str = DEFAULT_HOST,
+) -> dict:
     if port is None:
         return ""
 
@@ -153,7 +191,7 @@ def debugger_compose(*, port: int | None = None, base_url: str | None = None) ->
             "depends_on": {
                 "langgraph-postgres": {"condition": "service_healthy"},
             },
-            "ports": [f'"{port}:3968"'],
+            "ports": [_published_port(host, port, 3968)],
         }
     }
 
@@ -202,6 +240,8 @@ def compose_as_dict(
     # API version of the base image
     api_version: str | None = None,
     engine_runtime_mode: str = "combined_queue_worker",
+    # Host address that published ports bind to
+    host: str = DEFAULT_HOST,
 ) -> dict:
     """Create a docker compose file as a dictionary in YML style."""
     if postgres_uri is None:
@@ -232,7 +272,7 @@ def compose_as_dict(
     if include_db:
         services["langgraph-postgres"] = {
             "image": "pgvector/pgvector:pg16",
-            "ports": ['"5433:5432"'],
+            "ports": [_published_port(host, 5433, 5432)],
             "environment": {
                 "POSTGRES_DB": "postgres",
                 "POSTGRES_USER": "postgres",
@@ -256,7 +296,7 @@ def compose_as_dict(
     # Add optional debugger service if debugger_port is specified
     if debugger_port:
         services["langgraph-debugger"] = debugger_compose(
-            port=debugger_port, base_url=debugger_base_url
+            port=debugger_port, base_url=debugger_base_url, host=host
         )["langgraph-debugger"]
 
     # Add langgraph-api service
@@ -268,7 +308,7 @@ def compose_as_dict(
         api_environment["N_JOBS_PER_WORKER"] = '"0"'
 
     services["langgraph-api"] = {
-        "ports": [f'"{port}:8000"'],
+        "ports": [_published_port(host, port, 8000)],
         "depends_on": {
             "langgraph-redis": {"condition": "service_healthy"},
         },
@@ -313,11 +353,13 @@ def compose(
     base_image: str | None = None,
     api_version: str | None = None,
     engine_runtime_mode: str = "combined_queue_worker",
+    host: str = DEFAULT_HOST,
 ) -> str:
     """Create a docker compose file as a string."""
     compose_content = compose_as_dict(
         capabilities,
         port=port,
+        host=host,
         debugger_port=debugger_port,
         debugger_base_url=debugger_base_url,
         postgres_uri=postgres_uri,
