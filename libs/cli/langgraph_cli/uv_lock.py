@@ -19,6 +19,24 @@ from langgraph_cli._ignore import (
 )
 from langgraph_cli.schemas import Config
 
+# https://packaging.python.org/en/latest/specifications/name-normalization/
+_VALID_PACKAGE_NAME = re.compile(
+    r"[A-Z0-9]|[A-Z0-9][A-Z0-9._-]*[A-Z0-9]", flags=re.IGNORECASE
+)
+# Every boundary `str.splitlines` recognizes. Docker starts a new instruction at
+# `\n`, and the compose file that embeds the Dockerfile also breaks YAML lines on
+# `\r` and the Unicode line separators.
+_LINE_BREAK = re.compile("[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
+
+
+def _reject_line_breaks(value: str, *, description: str) -> str:
+    if _LINE_BREAK.search(value):
+        raise click.UsageError(
+            f"source.kind 'uv' cannot write {description} {value!r} into the "
+            "generated Dockerfile because it contains a line break."
+        )
+    return value
+
 
 @dataclass(frozen=True, slots=True)
 class UvLockSourceEntry:
@@ -74,6 +92,7 @@ class DockerBuildPlan:
 
     def add_instruction(self, opcode: str, value: str | None = None) -> None:
         if value:
+            _reject_line_breaks(value, description=f"{opcode} argument")
             self.lines.append(f"{opcode} {value}")
         else:
             self.lines.append(opcode)
@@ -398,6 +417,13 @@ def _discover_uv_lock_workspace_packages(
             raise click.UsageError(
                 "source.kind 'uv' requires every workspace package to define "
                 f"[project].name in {member_pyproject_path}."
+            )
+        if not _VALID_PACKAGE_NAME.fullmatch(package_name):
+            raise click.UsageError(
+                f"Invalid [project].name {package_name!r} in "
+                f"{member_pyproject_path}. source.kind 'uv' requires a valid "
+                "Python package name: ASCII letters, digits, '.', '_' and '-', "
+                "starting and ending with a letter or digit."
             )
 
         packages.append(
@@ -925,12 +951,15 @@ def python_config_to_docker_uv_lock(
     def copy_from_project_root(
         relative_path: pathlib.PurePosixPath, destination: str
     ) -> str:
+        _reject_line_breaks(destination, description="container path")
         if workspace_context_name is not None:
             source = relative_path.as_posix() or "."
+            _reject_line_breaks(source, description="path")
             return f"COPY --from={workspace_context_name} {source} {destination}"
 
         source_path = plan.project_root / pathlib.Path(relative_path)
         relative_source = source_path.relative_to(config_root).as_posix()
+        _reject_line_breaks(relative_source, description="path")
         return f"ADD {relative_source} {destination}"
 
     uv_export_project_dir = "/tmp/uv_export/project"
@@ -954,7 +983,9 @@ def python_config_to_docker_uv_lock(
         docker_plan.add_blank()
 
     if pip_config_file_str:
-        docker_plan.add_raw(pip_config_file_str)
+        docker_plan.add_raw(
+            _reject_line_breaks(pip_config_file_str, description="pip_config_file")
+        )
         docker_plan.add_blank()
 
     docker_plan.add_raw("# -- Installing dependencies from uv.lock --")
@@ -1010,7 +1041,10 @@ def python_config_to_docker_uv_lock(
 
     ignore_spec = _build_ignore_spec(plan.project_root, include_gitignore=False)
     for package in plan.install_order:
-        package_label = package.root.relative_to(plan.project_root).as_posix() or "."
+        package_label = _reject_line_breaks(
+            package.root.relative_to(plan.project_root).as_posix() or ".",
+            description="workspace package path",
+        )
         docker_plan.add_raw(f"# -- Adding workspace package {package_label} --")
         for source, destination in _uv_lock_package_copy_items(
             package, plan, ignore_spec
