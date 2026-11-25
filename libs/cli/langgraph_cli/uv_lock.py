@@ -12,6 +12,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10.
 import click
 import pathspec
 
+from langgraph_cli._dockerfile import validate_build_context, validate_dockerfile_path
 from langgraph_cli._ignore import (
     _build_dockerignore_negation_hints,
     _build_ignore_spec,
@@ -895,6 +896,7 @@ def python_config_to_docker_uv_lock(
         config, install_cmd
     )
     plan = _plan_uv_lock_workspace(config_path, config)
+    validate_dockerfile_path(plan.working_dir, description="Container path")
 
     _update_uv_lock_graph_paths(config_path, config, plan)
     for section, key in [
@@ -920,17 +922,24 @@ def python_config_to_docker_uv_lock(
         and config_root not in plan.project_root.parents
     ):
         workspace_context_name = "uv-workspace-root"
+        validate_build_context(workspace_context_name, str(plan.project_root))
         additional_contexts[workspace_context_name] = str(plan.project_root)
 
     def copy_from_project_root(
         relative_path: pathlib.PurePosixPath, destination: str
     ) -> str:
+        validate_dockerfile_path(destination, description="Container path")
         if workspace_context_name is not None:
-            source = relative_path.as_posix() or "."
+            source = validate_dockerfile_path(
+                relative_path.as_posix() or ".", description="Workspace path"
+            )
             return f"COPY --from={workspace_context_name} {source} {destination}"
 
         source_path = plan.project_root / pathlib.Path(relative_path)
-        relative_source = source_path.relative_to(config_root).as_posix()
+        relative_source = validate_dockerfile_path(
+            source_path.relative_to(config_root).as_posix(),
+            description="Workspace path",
+        )
         return f"ADD {relative_source} {destination}"
 
     uv_export_project_dir = "/tmp/uv_export/project"
@@ -1010,14 +1019,21 @@ def python_config_to_docker_uv_lock(
 
     ignore_spec = _build_ignore_spec(plan.project_root, include_gitignore=False)
     for package in plan.install_order:
-        package_label = package.root.relative_to(plan.project_root).as_posix() or "."
+        package_label = validate_dockerfile_path(
+            package.root.relative_to(plan.project_root).as_posix() or ".",
+            description="Workspace path",
+        )
         docker_plan.add_raw(f"# -- Adding workspace package {package_label} --")
         for source, destination in _uv_lock_package_copy_items(
             package, plan, ignore_spec
         ):
             docker_plan.add_raw(copy_from_project_root(source, destination.as_posix()))
         docker_plan.add_instruction(
-            "WORKDIR", plan.container_roots[package.root].as_posix()
+            "WORKDIR",
+            validate_dockerfile_path(
+                plan.container_roots[package.root].as_posix(),
+                description="Container path",
+            ),
         )
         docker_plan.add_instruction("RUN", f"{global_reqs_pip_install} --no-deps -e .")
         docker_plan.add_raw(f"# -- End of workspace package {package_label} --")
