@@ -40,6 +40,10 @@ def _get_overwrite(value: Any) -> tuple[bool, Any]:
       state update routed through the LangGraph API server). This keeps the
       `Overwrite` semantics intact across JSON boundaries that strip dataclass
       types.
+
+    The two dict forms are only trusted on writes produced by graph code.
+    Caller-supplied values (graph input, `Command` input, `update_state`) are
+    screened with `_is_json_overwrite` before they reach a channel.
     """
     if isinstance(value, Overwrite):
         return True, value.value
@@ -49,6 +53,11 @@ def _get_overwrite(value: Any) -> tuple[bool, Any]:
         if value.get("type") == OVERWRITE and "value" in value:
             return True, value["value"]
     return False, None
+
+
+def _is_json_overwrite(value: Any) -> bool:
+    """Return True if `value` is one of the plain-dict overwrite forms."""
+    return isinstance(value, dict) and _get_overwrite(value)[0]
 
 
 def _operators_equal(a: Callable, b: Callable) -> bool:

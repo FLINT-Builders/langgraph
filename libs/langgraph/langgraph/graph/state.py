@@ -71,6 +71,7 @@ from langgraph.managed.base import (
     is_managed_value,
 )
 from langgraph.pregel import Pregel
+from langgraph.pregel._io import reject_json_overwrite
 from langgraph.pregel._read import ChannelRead, PregelNode
 from langgraph.pregel._write import (
     ChannelWrite,
@@ -1491,11 +1492,23 @@ class CompiledStateGraph(
                 )
                 raise InvalidUpdateError(msg)
 
+        state_mapper = _get_root if output_keys == ["__root__"] else _get_updates
+        if key == START:
+            get_state_updates = state_mapper
+
+            def _get_input_updates(
+                input: None | dict | Any,
+            ) -> Sequence[tuple[str, Any]] | None:
+                updates = get_state_updates(input)
+                if updates:
+                    reject_json_overwrite(self.builder.channels, updates)
+                return updates
+
+            state_mapper = _get_input_updates
+
         # state updaters
         write_entries: tuple[ChannelWriteEntry | ChannelWriteTupleEntry, ...] = (
-            ChannelWriteTupleEntry(
-                mapper=_get_root if output_keys == ["__root__"] else _get_updates
-            ),
+            ChannelWriteTupleEntry(mapper=state_mapper),
             ChannelWriteTupleEntry(
                 mapper=_control_branch,
                 static=_control_static(node.ends)
