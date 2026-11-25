@@ -2502,7 +2502,7 @@ def test_config_to_compose_simple_config():
 
 def test_config_to_compose_env_vars():
     graphs = {"agent": "./agent.py:graph"}
-    expected_compose_stdin = f"""                        OPENAI_API_KEY: "key"
+    expected_compose_stdin = f"""                        "OPENAI_API_KEY": "key"
         
         pull_policy: build
         build:
@@ -2548,7 +2548,7 @@ def test_config_to_compose_env_vars():
 def test_config_to_compose_env_file():
     graphs = {"agent": "./agent.py:graph"}
     expected_compose_stdin = f"""\
-        env_file: .env
+        env_file: ".env"
         pull_policy: build
         build:
             context: .
@@ -2615,9 +2615,9 @@ def test_config_to_compose_watch():
         
         develop:
             watch:
-                - path: test_config.json
+                - path: "test_config.json"
                   action: rebuild
-                - path: .
+                - path: "."
                   action: rebuild\
 """
     actual_compose_stdin = config_to_compose(
@@ -2633,7 +2633,7 @@ def test_config_to_compose_end_to_end():
     # test all of the above + langgraph API path
     graphs = {"agent": "./agent.py:graph"}
     expected_compose_stdin = f"""\
-        env_file: .env
+        env_file: ".env"
         pull_policy: build
         build:
             context: .
@@ -2662,9 +2662,9 @@ def test_config_to_compose_end_to_end():
         
         develop:
             watch:
-                - path: test_config.json
+                - path: "test_config.json"
                   action: rebuild
-                - path: .
+                - path: "."
                   action: rebuild\
 """
     actual_compose_stdin = config_to_compose(
@@ -3314,7 +3314,7 @@ def test_config_to_compose_distributed_mode_with_env_file():
     )
 
     # env_file should appear multiple times: API, orchestrator, executor
-    env_file_count = actual_compose_stdin.count("env_file: .env")
+    env_file_count = actual_compose_stdin.count('env_file: ".env"')
     assert env_file_count == 3, (
         f"Expected env_file to appear 3 times (api, orchestrator, executor), "
         f"got {env_file_count}"

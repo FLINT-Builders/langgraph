@@ -481,6 +481,13 @@ def validate_config(config: Config) -> Config:
                 '  "image_distro": "wolfi"  (recommended)'
             )
 
+    env = config["env"]
+    if isinstance(env, str) and not env.isprintable():
+        raise click.UsageError(
+            "Invalid `env`: the path to the .env file must not contain "
+            "newlines or other control characters."
+        )
+
     if source_kind == "uv":
         errors: list[str] = []
         if not config.get("python_version"):
@@ -1648,6 +1655,28 @@ def config_to_docker(
     )
 
 
+def _yaml_quote(value: object) -> str:
+    """Render `value` as a YAML double-quoted scalar.
+
+    Every character outside printable ASCII is escaped, so a config value can
+    neither close the scalar nor start a new line in the compose document.
+    """
+    chars = []
+    for ch in str(value):
+        code = ord(ch)
+        if ch in ('"', "\\"):
+            chars.append("\\" + ch)
+        elif 0x20 <= code < 0x7F:
+            chars.append(ch)
+        elif code <= 0xFF:
+            chars.append(f"\\x{code:02x}")
+        elif code <= 0xFFFF:
+            chars.append(f"\\u{code:04x}")
+        else:
+            chars.append(f"\\U{code:08x}")
+    return '"' + "".join(chars) + '"'
+
+
 def config_to_compose(
     config_path: pathlib.Path,
     config: Config,
@@ -1660,9 +1689,13 @@ def config_to_compose(
     base_image = base_image or default_base_image(config)
 
     env_vars = config["env"].items() if isinstance(config["env"], dict) else {}
-    env_vars_str = "\n".join(f'            {k}: "{v}"' for k, v in env_vars)
+    env_vars_str = "\n".join(
+        f"            {_yaml_quote(k)}: {_yaml_quote(v)}" for k, v in env_vars
+    )
     env_file_str = (
-        f"env_file: {config['env']}" if isinstance(config["env"], str) else ""
+        f"env_file: {_yaml_quote(config['env'])}"
+        if isinstance(config["env"], str)
+        else ""
     )
     if watch:
         dependencies = config.get("dependencies") or ["."]
@@ -1670,7 +1703,7 @@ def config_to_compose(
             dep for dep in dependencies if dep.startswith(".")
         ]
         watch_actions = "\n".join(
-            f"""- path: {path}
+            f"""- path: {_yaml_quote(path)}
   action: rebuild"""
             for path in watch_paths
         )
@@ -1703,7 +1736,7 @@ def config_to_compose(
         )
 
         additional_contexts_str = "\n".join(
-            f"                - {name}: {path}"
+            f"                - {_yaml_quote(name)}: {_yaml_quote(path)}"
             for name, path in additional_contexts.items()
         )
         if additional_contexts_str:
@@ -1735,7 +1768,7 @@ def config_to_compose(
             )
 
             executor_additional_contexts_str = "\n".join(
-                f"                    - {name}: {path}"
+                f"                    - {_yaml_quote(name)}: {_yaml_quote(path)}"
                 for name, path in executor_additional_contexts.items()
             )
             if executor_additional_contexts_str:
