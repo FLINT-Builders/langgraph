@@ -26,6 +26,14 @@ from langgraph.checkpoint.base import (
     get_checkpoint_id,
     get_checkpoint_metadata,
 )
+from langgraph.checkpoint.serde.base import (
+    blob_context,
+    checkpoint_context,
+    dumps_typed_bound,
+    loads_typed_bound,
+    metadata_context,
+    write_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -136,8 +144,30 @@ class InMemorySaver(
             vv = self.blobs[kk]
             if vv[0] == "empty":
                 continue
-            result[k] = self.serde.loads_typed(vv)
+            result[k] = loads_typed_bound(
+                self.serde, vv, blob_context(thread_id, checkpoint_ns, k, ver)
+            )
         return result
+
+    def _load_writes(
+        self,
+        thread_id: str,
+        checkpoint_ns: str,
+        checkpoint_id: str,
+        writes: Mapping[tuple[str, int], tuple[str, str, tuple[str, bytes], str]],
+    ) -> list[PendingWrite]:
+        return [
+            (
+                tid,
+                c,
+                loads_typed_bound(
+                    self.serde,
+                    v,
+                    write_context(thread_id, checkpoint_ns, checkpoint_id, tid, idx, c),
+                ),
+            )
+            for (_, idx), (tid, c, v, _) in writes.items()
+        ]
 
     def get_delta_channel_history(
         self, *, config: RunnableConfig, channels: Sequence[str]
@@ -182,7 +212,15 @@ class InMemorySaver(
             if not remaining:
                 break
             entry = ns_storage.get(cp_id)
-            ckpt = self.serde.loads_typed(entry[0]) if entry is not None else None
+            ckpt = (
+                loads_typed_bound(
+                    self.serde,
+                    entry[0],
+                    checkpoint_context(thread_id, checkpoint_ns, cp_id),
+                )
+                if entry is not None
+                else None
+            )
 
             terminated_here: set[str] = set()
             blob_value_by_ch: dict[str, Any] = {}
@@ -195,17 +233,31 @@ class InMemorySaver(
                     blob_entry = self.blobs.get((thread_id, checkpoint_ns, ch, ver))
                     if blob_entry is None or blob_entry[0] == "empty":
                         continue
-                    blob_value_by_ch[ch] = self.serde.loads_typed(blob_entry)
+                    blob_value_by_ch[ch] = loads_typed_bound(
+                        self.serde,
+                        blob_entry,
+                        blob_context(thread_id, checkpoint_ns, ch, ver),
+                    )
                     terminated_here.add(ch)
 
             step_writes = self.writes.get((thread_id, checkpoint_ns, cp_id), {})
-            for (_task_id, _idx), (tid, ch, serialized, _) in sorted(
+            for (_task_id, idx), (tid, ch, serialized, _) in sorted(
                 step_writes.items(), reverse=True
             ):
                 if ch not in remaining:
                     continue
                 collected_by_ch[ch].append(
-                    (tid, ch, self.serde.loads_typed(serialized))
+                    (
+                        tid,
+                        ch,
+                        loads_typed_bound(
+                            self.serde,
+                            serialized,
+                            write_context(
+                                thread_id, checkpoint_ns, cp_id, tid, idx, ch
+                            ),
+                        ),
+                    )
                 )
 
             for ch in terminated_here:
@@ -246,8 +298,12 @@ class InMemorySaver(
         if checkpoint_id := get_checkpoint_id(config):
             if saved := self.storage[thread_id][checkpoint_ns].get(checkpoint_id):
                 checkpoint, metadata, parent_checkpoint_id = saved
-                writes = self.writes[(thread_id, checkpoint_ns, checkpoint_id)].values()
-                checkpoint_: Checkpoint = self.serde.loads_typed(checkpoint)
+                writes = self.writes[(thread_id, checkpoint_ns, checkpoint_id)]
+                checkpoint_: Checkpoint = loads_typed_bound(
+                    self.serde,
+                    checkpoint,
+                    checkpoint_context(thread_id, checkpoint_ns, checkpoint_id),
+                )
                 return CheckpointTuple(
                     config=config,
                     checkpoint={
@@ -256,10 +312,14 @@ class InMemorySaver(
                             thread_id, checkpoint_ns, checkpoint_["channel_versions"]
                         ),
                     },
-                    metadata=self.serde.loads_typed(metadata),
-                    pending_writes=[
-                        (id, c, self.serde.loads_typed(v)) for id, c, v, _ in writes
-                    ],
+                    metadata=loads_typed_bound(
+                        self.serde,
+                        metadata,
+                        metadata_context(thread_id, checkpoint_ns, checkpoint_id),
+                    ),
+                    pending_writes=self._load_writes(
+                        thread_id, checkpoint_ns, checkpoint_id, writes
+                    ),
                     parent_config=(
                         {
                             "configurable": {
@@ -276,8 +336,12 @@ class InMemorySaver(
             if checkpoints := self.storage[thread_id][checkpoint_ns]:
                 checkpoint_id = max(checkpoints.keys())
                 checkpoint, metadata, parent_checkpoint_id = checkpoints[checkpoint_id]
-                writes = self.writes[(thread_id, checkpoint_ns, checkpoint_id)].values()
-                checkpoint_ = self.serde.loads_typed(checkpoint)
+                writes = self.writes[(thread_id, checkpoint_ns, checkpoint_id)]
+                checkpoint_ = loads_typed_bound(
+                    self.serde,
+                    checkpoint,
+                    checkpoint_context(thread_id, checkpoint_ns, checkpoint_id),
+                )
                 return CheckpointTuple(
                     config={
                         "configurable": {
@@ -292,10 +356,14 @@ class InMemorySaver(
                             thread_id, checkpoint_ns, checkpoint_["channel_versions"]
                         ),
                     },
-                    metadata=self.serde.loads_typed(metadata),
-                    pending_writes=[
-                        (id, c, self.serde.loads_typed(v)) for id, c, v, _ in writes
-                    ],
+                    metadata=loads_typed_bound(
+                        self.serde,
+                        metadata,
+                        metadata_context(thread_id, checkpoint_ns, checkpoint_id),
+                    ),
+                    pending_writes=self._load_writes(
+                        thread_id, checkpoint_ns, checkpoint_id, writes
+                    ),
                     parent_config=(
                         {
                             "configurable": {
@@ -366,7 +434,11 @@ class InMemorySaver(
                         continue
 
                     # filter by metadata
-                    metadata = self.serde.loads_typed(metadata_b)
+                    metadata = loads_typed_bound(
+                        self.serde,
+                        metadata_b,
+                        metadata_context(thread_id, checkpoint_ns, checkpoint_id),
+                    )
                     if filter and not all(
                         query_value == metadata.get(query_key)
                         for query_key, query_value in filter.items()
@@ -379,11 +451,13 @@ class InMemorySaver(
                     elif limit is not None:
                         limit -= 1
 
-                    writes = self.writes[
-                        (thread_id, checkpoint_ns, checkpoint_id)
-                    ].values()
+                    writes = self.writes[(thread_id, checkpoint_ns, checkpoint_id)]
 
-                    checkpoint_: Checkpoint = self.serde.loads_typed(checkpoint)
+                    checkpoint_: Checkpoint = loads_typed_bound(
+                        self.serde,
+                        checkpoint,
+                        checkpoint_context(thread_id, checkpoint_ns, checkpoint_id),
+                    )
 
                     yield CheckpointTuple(
                         config={
@@ -413,9 +487,9 @@ class InMemorySaver(
                             if parent_checkpoint_id
                             else None
                         ),
-                        pending_writes=[
-                            (id, c, self.serde.loads_typed(v)) for id, c, v, _ in writes
-                        ],
+                        pending_writes=self._load_writes(
+                            thread_id, checkpoint_ns, checkpoint_id, writes
+                        ),
                     )
 
     def put(
@@ -445,13 +519,27 @@ class InMemorySaver(
         values: dict[str, Any] = c.pop("channel_values")  # type: ignore[misc]
         for k, v in new_versions.items():
             self.blobs[(thread_id, checkpoint_ns, k, v)] = (
-                self.serde.dumps_typed(values[k]) if k in values else ("empty", b"")
+                dumps_typed_bound(
+                    self.serde,
+                    values[k],
+                    blob_context(thread_id, checkpoint_ns, k, v),
+                )
+                if k in values
+                else ("empty", b"")
             )
         self.storage[thread_id][checkpoint_ns].update(
             {
                 checkpoint["id"]: (
-                    self.serde.dumps_typed(c),
-                    self.serde.dumps_typed(get_checkpoint_metadata(config, metadata)),
+                    dumps_typed_bound(
+                        self.serde,
+                        c,
+                        checkpoint_context(thread_id, checkpoint_ns, checkpoint["id"]),
+                    ),
+                    dumps_typed_bound(
+                        self.serde,
+                        get_checkpoint_metadata(config, metadata),
+                        metadata_context(thread_id, checkpoint_ns, checkpoint["id"]),
+                    ),
                     config["configurable"].get("checkpoint_id"),  # parent
                 )
             }
@@ -498,7 +586,18 @@ class InMemorySaver(
             self.writes[outer_key][inner_key] = (
                 task_id,
                 c,
-                self.serde.dumps_typed(v),
+                dumps_typed_bound(
+                    self.serde,
+                    v,
+                    write_context(
+                        thread_id,
+                        checkpoint_ns,
+                        checkpoint_id,
+                        task_id,
+                        inner_key[1],
+                        c,
+                    ),
+                ),
                 task_path,
             )
 

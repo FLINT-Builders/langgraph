@@ -5,7 +5,17 @@ import threading
 from collections.abc import Mapping, Sequence
 
 from langgraph.cache.base import BaseCache, FullKey, Namespace, ValueT
-from langgraph.checkpoint.serde.base import SerializerProtocol
+from langgraph.checkpoint.serde.base import (
+    RecordContext,
+    SerializerProtocol,
+    cache_context,
+    dumps_typed_bound,
+    loads_typed_bound,
+)
+
+
+def _context(ns: Namespace, key: str) -> RecordContext:
+    return cache_context(str(len(ns)), *ns, key)
 
 
 class InMemoryCache(BaseCache[ValueT]):
@@ -26,7 +36,9 @@ class InMemoryCache(BaseCache[ValueT]):
                 if ns in self._cache and key in self._cache[ns]:
                     enc, val, expiry = self._cache[ns][key]
                     if expiry is None or now < expiry:
-                        values[(ns, key)] = self.serde.loads_typed((enc, val))
+                        values[(ns, key)] = loads_typed_bound(
+                            self.serde, (enc, val), _context(ns, key)
+                        )
                     else:
                         del self._cache[ns][key]
             return values
@@ -48,7 +60,7 @@ class InMemoryCache(BaseCache[ValueT]):
                 if ns not in self._cache:
                     self._cache[ns] = {}
                 self._cache[ns][key] = (
-                    *self.serde.dumps_typed(value),
+                    *dumps_typed_bound(self.serde, value, _context(ns, key)),
                     expiry,
                 )
 

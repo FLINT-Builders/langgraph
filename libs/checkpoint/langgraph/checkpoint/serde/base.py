@@ -1,6 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
+
+RecordContext = Sequence[str | int | float | None]
+"""Identity of the storage record a serialized value is written to.
+
+Savers and caches pass the record's key (thread ID, namespace, channel,
+version, task ID, index, ...) so a serializer that supports it can bind the
+serialized bytes to that record and refuse them anywhere else.
+"""
 
 
 class UntypedSerializerProtocol(Protocol):
@@ -46,6 +55,72 @@ def maybe_add_typed_methods(
         return SerializerCompat(serde)
 
     return serde
+
+
+def dumps_typed_bound(
+    serde: SerializerProtocol, obj: Any, context: RecordContext
+) -> tuple[str, bytes]:
+    """Serialize `obj` for the storage record identified by `context`.
+
+    Serializers that implement `dumps_typed_bound` (such as
+    `EncryptedSerializer`) bind the output to `context`; others fall back to
+    `dumps_typed`.
+    """
+    bound = getattr(serde, "dumps_typed_bound", None)
+    if bound is None:
+        return serde.dumps_typed(obj)
+    return bound(obj, context)
+
+
+def loads_typed_bound(
+    serde: SerializerProtocol, data: tuple[str, bytes], context: RecordContext
+) -> Any:
+    """Deserialize `data` read from the storage record identified by `context`.
+
+    Serializers that implement `loads_typed_bound` (such as
+    `EncryptedSerializer`) reject data that was bound to a different record;
+    others fall back to `loads_typed`.
+    """
+    bound = getattr(serde, "loads_typed_bound", None)
+    if bound is None:
+        return serde.loads_typed(data)
+    return bound(data, context)
+
+
+def checkpoint_context(
+    thread_id: str, checkpoint_ns: str, checkpoint_id: str
+) -> RecordContext:
+    return ("checkpoint", thread_id, checkpoint_ns, checkpoint_id)
+
+
+def metadata_context(
+    thread_id: str, checkpoint_ns: str, checkpoint_id: str
+) -> RecordContext:
+    return ("metadata", thread_id, checkpoint_ns, checkpoint_id)
+
+
+def blob_context(
+    thread_id: str,
+    checkpoint_ns: str,
+    channel: str,
+    version: str | int | float | None,
+) -> RecordContext:
+    return ("blob", thread_id, checkpoint_ns, channel, version)
+
+
+def write_context(
+    thread_id: str,
+    checkpoint_ns: str,
+    checkpoint_id: str,
+    task_id: str,
+    idx: int | str,
+    channel: str,
+) -> RecordContext:
+    return ("write", thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel)
+
+
+def cache_context(*key: str) -> RecordContext:
+    return ("cache", *key)
 
 
 class CipherProtocol(Protocol):

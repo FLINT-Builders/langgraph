@@ -4,7 +4,12 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from langgraph.cache.base import BaseCache, FullKey, Namespace, ValueT
-from langgraph.checkpoint.serde.base import SerializerProtocol
+from langgraph.checkpoint.serde.base import (
+    SerializerProtocol,
+    cache_context,
+    dumps_typed_bound,
+    loads_typed_bound,
+)
 
 
 class RedisCache(BaseCache[ValueT]):
@@ -70,7 +75,11 @@ class RedisCache(BaseCache[ValueT]):
                 try:
                     # Deserialize the value
                     encoding, data = raw_value.split(b":", 1)
-                    values[keys[i]] = self.serde.loads_typed((encoding.decode(), data))
+                    values[keys[i]] = loads_typed_bound(
+                        self.serde,
+                        (encoding.decode(), data),
+                        cache_context(redis_keys[i]),
+                    )
                 except Exception:
                     # Skip corrupted entries
                     continue
@@ -91,7 +100,9 @@ class RedisCache(BaseCache[ValueT]):
 
         for (ns, key), (value, ttl) in mapping.items():
             redis_key = self._make_key(ns, key)
-            encoding, data = self.serde.dumps_typed(value)
+            encoding, data = dumps_typed_bound(
+                self.serde, value, cache_context(redis_key)
+            )
 
             # Store as "encoding:data" format
             serialized_value = f"{encoding}:".encode() + data
