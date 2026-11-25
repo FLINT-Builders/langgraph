@@ -141,7 +141,7 @@ services:
         build:
             context: .
             additional_contexts:
-                - cli_1: {str(pathlib.Path(__file__).parent.parent.parent.parent.absolute())}
+                - "cli_1": "{str(pathlib.Path(__file__).parent.parent.parent.parent.absolute())}"
             dockerfile_inline: |
                 # syntax=docker/dockerfile:1.4
                 FROM langchain/langgraph-api:3.11
@@ -160,11 +160,11 @@ services:
         
         develop:
             watch:
-                - path: langgraph.json
+                - path: "langgraph.json"
                   action: rebuild
-                - path: .
+                - path: "."
                   action: rebuild
-                - path: ../../..
+                - path: "../../.."
                   action: rebuild\
 """
     assert actual_args == expected_args
@@ -264,11 +264,11 @@ services:
         
         develop:
             watch:
-                - path: langgraph.json
+                - path: "langgraph.json"
                   action: rebuild
-                - path: .
+                - path: "."
                   action: rebuild
-                - path: ../../..
+                - path: "../../.."
                   action: rebuild\
 """
     assert actual_args == expected_args
