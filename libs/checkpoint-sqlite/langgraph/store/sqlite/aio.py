@@ -25,12 +25,14 @@ from langgraph.store.base.batch import AsyncBatchedBaseStore
 from langgraph.store.sqlite.base import (
     _PLACEHOLDER,
     NS_MATCH_FUNCTION,
+    NUMBER_CMP_FUNCTION,
     BaseSqliteStore,
     SqliteIndexConfig,
     _decode_ns_text,
     _ensure_index_config,
     _group_ops,
     _namespace_match,
+    _number_cmp,
     _row_to_item,
     _row_to_search_item,
 )
@@ -157,6 +159,9 @@ class AsyncSqliteStore(AsyncBatchedBaseStore, BaseSqliteStore):
             # because aiosqlite's create_function is a coroutine.
             await self.conn.create_function(
                 NS_MATCH_FUNCTION, 2, _namespace_match, deterministic=True
+            )
+            await self.conn.create_function(
+                NUMBER_CMP_FUNCTION, 3, _number_cmp, deterministic=True
             )
 
             # Create migrations table if it doesn't exist

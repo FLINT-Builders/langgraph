@@ -105,9 +105,12 @@ import asyncio
 import concurrent.futures as cf
 import functools
 import logging
+import math
+import numbers
 from collections import defaultdict
 from collections.abc import Iterable
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from importlib import util
 from typing import Any
 
@@ -574,18 +577,54 @@ def _compare_values(item_value: Any, filter_value: Any) -> bool:
         return item_value == filter_value
 
 
+def _as_ordered_number(value: Any) -> numbers.Real | Decimal | None:
+    """Return `value` as an exact number for range comparison, or `None`.
+
+    Python orders `int`, `float`, `Fraction`, and `Decimal` against each other
+    exactly, so distinct integers above 2**53 are never collapsed onto the same
+    double the way `float()` on both sides would. Numeric strings are parsed
+    with `Decimal` for the same reason.
+
+    NaN and non-numeric values have no ordering and never satisfy a range
+    operator.
+    """
+    number: numbers.Real | Decimal
+    if isinstance(value, numbers.Integral):
+        number = int(value)
+    elif isinstance(value, (float, Decimal, numbers.Rational)):
+        number = value
+    elif isinstance(value, numbers.Real):
+        number = float(value)
+    elif isinstance(value, str):
+        try:
+            number = Decimal(value)
+        except InvalidOperation:
+            return None
+    else:
+        return None
+    if isinstance(number, Decimal):
+        return None if number.is_nan() else number
+    if isinstance(number, float) and math.isnan(number):
+        return None
+    return number
+
+
 def _apply_operator(value: Any, operator: str, op_value: Any) -> bool:
     """Apply a comparison operator, matching PostgreSQL's JSONB behavior."""
     if operator == "$eq":
         return value == op_value
-    elif operator == "$gt":
-        return float(value) > float(op_value)
-    elif operator == "$gte":
-        return float(value) >= float(op_value)
-    elif operator == "$lt":
-        return float(value) < float(op_value)
-    elif operator == "$lte":
-        return float(value) <= float(op_value)
+    elif operator in ("$gt", "$gte", "$lt", "$lte"):
+        left = _as_ordered_number(value)
+        right = _as_ordered_number(op_value)
+        if left is None or right is None:
+            return False
+        if operator == "$gt":
+            return left > right
+        elif operator == "$gte":
+            return left >= right
+        elif operator == "$lt":
+            return left < right
+        return left <= right
     elif operator == "$ne":
         return value != op_value
     else:
