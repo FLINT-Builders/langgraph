@@ -5,6 +5,7 @@ import pathlib
 import re
 import shlex
 import textwrap
+import unicodedata
 from collections import Counter
 from typing import Literal, NamedTuple
 
@@ -1615,6 +1616,73 @@ def _calculate_relative_workdir(config_path: pathlib.Path, build_context: str) -
         ) from None
 
 
+def _has_control_characters(value: str) -> bool:
+    # Zl/Zp (U+2028, U+2029) are line breaks to YAML parsers such as go-yaml.
+    return any(unicodedata.category(char) in ("Cc", "Zl", "Zp") for char in value)
+
+
+def _validate_additional_contexts(additional_contexts: dict[str, str]) -> None:
+    for name, path in additional_contexts.items():
+        if _has_control_characters(name):
+            raise ValueError(
+                f"Build context name {name!r} contains a newline or control "
+                "character. Rename the directory."
+            )
+        if _has_control_characters(path):
+            raise ValueError(
+                f"Build context path {path!r} contains a newline or control "
+                "character. Rename the directory."
+            )
+
+
+_COMPOSE_PLAIN_SCALAR_RE = re.compile(
+    r"(?:/|\.{1,2}/|\.{1,2}$|\.?[A-Za-z_])[A-Za-z0-9_./@+=-]*"
+)
+_YAML_NON_STRING_PLAIN_RE = re.compile(
+    r"(?i)y|n|yes|no|true|false|on|off|null|\.inf|\.nan"
+)
+
+
+def _yaml_double_quoted(value: object) -> str:
+    """Render `value` as a single-line YAML double-quoted scalar."""
+    escaped = []
+    for char in str(value):
+        code = ord(char)
+        if char in ('"', "\\"):
+            escaped.append("\\" + char)
+        elif char.isprintable():
+            escaped.append(char)
+        elif code <= 0xFF:
+            escaped.append(f"\\x{code:02x}")
+        elif code <= 0xFFFF:
+            escaped.append(f"\\u{code:04x}")
+        else:
+            escaped.append(f"\\U{code:08x}")
+    return '"' + "".join(escaped) + '"'
+
+
+def _compose_scalar(value: object) -> str:
+    """Render `value` as a single YAML scalar for the generated Compose file.
+
+    Values that YAML would read as anything other than the same plain string
+    are double-quoted.
+    """
+    value = str(value)
+    if _COMPOSE_PLAIN_SCALAR_RE.fullmatch(
+        value
+    ) and not _YAML_NON_STRING_PLAIN_RE.fullmatch(value):
+        return value
+    return _yaml_double_quoted(value)
+
+
+def _indent_block_scalar(text: str, prefix: str) -> str:
+    # Whitespace-only lines are indented too: a less-indented one would end
+    # the enclosing YAML literal block early.
+    return textwrap.indent(
+        text, prefix, lambda line: line not in ("\n", "\r\n", "\r", "")
+    )
+
+
 def config_to_docker(
     config_path: pathlib.Path,
     config: Config,
@@ -1629,7 +1697,7 @@ def config_to_docker(
     base_image = base_image or default_base_image(config)
 
     if config.get("node_version") and not config.get("python_version"):
-        return node_config_to_docker(
+        dockerfile, additional_contexts = node_config_to_docker(
             config_path=config_path,
             config=config,
             base_image=base_image,
@@ -1638,14 +1706,17 @@ def config_to_docker(
             build_command=build_command,
             build_context=build_context,
         )
+    else:
+        dockerfile, additional_contexts = python_config_to_docker(
+            config_path=config_path,
+            config=config,
+            base_image=base_image,
+            api_version=api_version,
+            escape_variables=escape_variables,
+        )
 
-    return python_config_to_docker(
-        config_path=config_path,
-        config=config,
-        base_image=base_image,
-        api_version=api_version,
-        escape_variables=escape_variables,
-    )
+    _validate_additional_contexts(additional_contexts)
+    return dockerfile, additional_contexts
 
 
 def config_to_compose(
@@ -1660,9 +1731,14 @@ def config_to_compose(
     base_image = base_image or default_base_image(config)
 
     env_vars = config["env"].items() if isinstance(config["env"], dict) else {}
-    env_vars_str = "\n".join(f'            {k}: "{v}"' for k, v in env_vars)
+    env_vars_str = "\n".join(
+        f"            {_compose_scalar(k)}: {_yaml_double_quoted(v)}"
+        for k, v in env_vars
+    )
     env_file_str = (
-        f"env_file: {config['env']}" if isinstance(config["env"], str) else ""
+        f"env_file: {_compose_scalar(config['env'])}"
+        if isinstance(config["env"], str)
+        else ""
     )
     if watch:
         dependencies = config.get("dependencies") or ["."]
@@ -1670,7 +1746,7 @@ def config_to_compose(
             dep for dep in dependencies if dep.startswith(".")
         ]
         watch_actions = "\n".join(
-            f"""- path: {path}
+            f"""- path: {_compose_scalar(path)}
   action: rebuild"""
             for path in watch_paths
         )
@@ -1703,7 +1779,7 @@ def config_to_compose(
         )
 
         additional_contexts_str = "\n".join(
-            f"                - {name}: {path}"
+            f"                - {_compose_scalar(name)}: {_compose_scalar(path)}"
             for name, path in additional_contexts.items()
         )
         if additional_contexts_str:
@@ -1718,7 +1794,7 @@ def config_to_compose(
         build:
             context: .{additional_contexts_str}
             dockerfile_inline: |
-{textwrap.indent(dockerfile, "                ")}
+{_indent_block_scalar(dockerfile, "                ")}
         {watch_str}
 """
 
@@ -1735,7 +1811,8 @@ def config_to_compose(
             )
 
             executor_additional_contexts_str = "\n".join(
-                f"                    - {name}: {path}"
+                f"                    - {_compose_scalar(name)}: "
+                f"{_compose_scalar(path)}"
                 for name, path in executor_additional_contexts.items()
             )
             if executor_additional_contexts_str:
@@ -1774,7 +1851,7 @@ def config_to_compose(
         build:
             context: .{executor_additional_contexts_str}
             dockerfile_inline: |
-{textwrap.indent(executor_dockerfile, "                ")}
+{_indent_block_scalar(executor_dockerfile, "                ")}
 """
 
         return result
