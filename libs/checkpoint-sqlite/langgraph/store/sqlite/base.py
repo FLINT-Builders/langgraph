@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import datetime
 import logging
+import math
 import re
 import sqlite3
 import threading
@@ -187,6 +188,57 @@ def _validate_filter_key(key: str) -> None:
         raise ValueError(
             f"Invalid filter key: '{key}'. Filter keys must contain only alphanumeric characters, underscores, dots, and hyphens."
         )
+
+
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+# `orjson` writes integers up to 2**64 - 1, but SQLite's JSON functions read
+# integers above the signed 64-bit range back as REAL (rounding up to 2**64),
+# so a filter integer in that band cannot be told apart from its neighbors.
+_AMBIGUOUS_INT_MAX = 2**64
+
+
+def _numeric_filter_condition(
+    expr: str, op: str, value: int | float
+) -> tuple[str, list]:
+    """Compare a SQL expression with a Python number without rounding integers.
+
+    SQLite compares INTEGER and REAL values exactly, so integers are bound as
+    integers and floats as floats. Converting an integer to a double would make
+    distinct integers above 2**53 compare equal.
+    """
+    if isinstance(value, float):
+        return f"{expr} {op} ?", [float(value)]
+    value = int(value)
+    if _INT64_MIN <= value <= _INT64_MAX:
+        return f"{expr} {op} ?", [value]
+    if _INT64_MAX < value <= _AMBIGUOUS_INT_MAX:
+        raise ValueError(
+            f"Integer filter value {value} cannot be compared exactly: SQLite "
+            "reads JSON integers above 2**63 - 1 as floating point."
+        )
+    # Outside the integer range a stored value can hold, so only REAL values can
+    # match. Compare against the doubles on either side of `value`, which is exact.
+    try:
+        nearest = float(value)
+    except OverflowError:
+        nearest = math.inf if value > 0 else -math.inf
+    if nearest == value:
+        return f"{expr} {op} ?", [nearest]
+    if nearest > value:
+        below, above = math.nextafter(nearest, -math.inf), nearest
+    else:
+        below, above = nearest, math.nextafter(nearest, math.inf)
+    if op == "=":
+        return "0", []
+    if op == "!=":
+        return f"{expr} IS NOT NULL", []
+    if op in (">", ">="):
+        return f"{expr} > ?", [below]
+    return f"{expr} < ?", [above]
+
+
+_RANGE_OPERATORS = {"$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<="}
 
 
 def _json_loads(content: bytes | str | orjson.Fragment) -> Any:
@@ -485,11 +537,11 @@ class BaseSqliteStore:
                                 + ("1" if value else "0")
                             )
                         elif isinstance(value, (int, float)):
-                            # Use parameterized query to handle special floats and large integers
-                            filter_conditions.append(
-                                "json_extract(value, '$." + key + "') = ?"
+                            condition, filter_params_ = _numeric_filter_condition(
+                                "json_extract(value, '$." + key + "')", "=", value
                             )
-                            filter_params.append(float(value))
+                            filter_conditions.append(condition)
+                            filter_params.extend(filter_params_)
                         else:
                             # Complex objects (list, dict, …) – compare JSON text
                             filter_conditions.append(
@@ -725,49 +777,25 @@ class BaseSqliteStore:
                 # SQLite JSON stores booleans as integers
                 return f"json_extract(value, '$.{key}') = {1 if value else 0}", []
             elif isinstance(value, (int, float)):
-                # Convert to float to handle inf, -inf, nan, and very large integers
-                # SQLite REAL can handle these cases better than INTEGER
-                return f"json_extract(value, '$.{key}') = ?", [float(value)]
+                return _numeric_filter_condition(
+                    f"json_extract(value, '$.{key}')", "=", value
+                )
             else:
                 return f"json_extract(value, '$.{key}') = ?", [orjson.dumps(value)]
-        elif op == "$gt":
-            # For numeric values, SQLite needs to compare as numbers, not strings
+        elif op in _RANGE_OPERATORS:
+            sql_op = _RANGE_OPERATORS[op]
             if isinstance(value, (int, float)):
-                # Convert to float to handle special values and very large integers
-                return f"CAST(json_extract(value, '$.{key}') AS REAL) > ?", [
-                    float(value)
-                ]
+                # NUMERIC (unlike REAL) keeps 64-bit integers exact while still
+                # coercing numeric strings for comparison.
+                return _numeric_filter_condition(
+                    f"CAST(json_extract(value, '$.{key}') AS NUMERIC)", sql_op, value
+                )
             elif isinstance(value, str):
-                return f"json_extract(value, '$.{key}') > ?", [value]
+                return f"json_extract(value, '$.{key}') {sql_op} ?", [value]
             else:
-                return f"json_extract(value, '$.{key}') > ?", [orjson.dumps(value)]
-        elif op == "$gte":
-            if isinstance(value, (int, float)):
-                return f"CAST(json_extract(value, '$.{key}') AS REAL) >= ?", [
-                    float(value)
+                return f"json_extract(value, '$.{key}') {sql_op} ?", [
+                    orjson.dumps(value)
                 ]
-            elif isinstance(value, str):
-                return f"json_extract(value, '$.{key}') >= ?", [value]
-            else:
-                return f"json_extract(value, '$.{key}') >= ?", [orjson.dumps(value)]
-        elif op == "$lt":
-            if isinstance(value, (int, float)):
-                return f"CAST(json_extract(value, '$.{key}') AS REAL) < ?", [
-                    float(value)
-                ]
-            elif isinstance(value, str):
-                return f"json_extract(value, '$.{key}') < ?", [value]
-            else:
-                return f"json_extract(value, '$.{key}') < ?", [orjson.dumps(value)]
-        elif op == "$lte":
-            if isinstance(value, (int, float)):
-                return f"CAST(json_extract(value, '$.{key}') AS REAL) <= ?", [
-                    float(value)
-                ]
-            elif isinstance(value, str):
-                return f"json_extract(value, '$.{key}') <= ?", [value]
-            else:
-                return f"json_extract(value, '$.{key}') <= ?", [orjson.dumps(value)]
         elif op == "$ne":
             if isinstance(value, str):
                 return f"json_extract(value, '$.{key}') != ?", [value]
@@ -776,8 +804,9 @@ class BaseSqliteStore:
             elif isinstance(value, bool):
                 return f"json_extract(value, '$.{key}') != {1 if value else 0}", []
             elif isinstance(value, (int, float)):
-                # Convert to float for consistency
-                return f"json_extract(value, '$.{key}') != ?", [float(value)]
+                return _numeric_filter_condition(
+                    f"json_extract(value, '$.{key}')", "!=", value
+                )
             else:
                 return f"json_extract(value, '$.{key}') != ?", [orjson.dumps(value)]
         else:
@@ -934,78 +963,6 @@ class SqliteStore(BaseSqliteStore, BaseStore):
                 )
 
         return results
-
-    def _get_filter_condition(self, key: str, op: str, value: Any) -> tuple[str, list]:
-        """Helper to generate filter conditions."""
-        _validate_filter_key(key)
-
-        # We need to properly format values for SQLite JSON extraction comparison
-        if op == "$eq":
-            if isinstance(value, str):
-                return f"json_extract(value, '$.{key}') = ?", [value]
-            elif value is None:
-                return f"json_extract(value, '$.{key}') IS NULL", []
-            elif isinstance(value, bool):
-                # SQLite JSON stores booleans as integers
-                return f"json_extract(value, '$.{key}') = {1 if value else 0}", []
-            elif isinstance(value, (int, float)):
-                # Convert to float to handle inf, -inf, nan, and very large integers
-                # SQLite REAL can handle these cases better than INTEGER
-                return f"json_extract(value, '$.{key}') = ?", [float(value)]
-            else:
-                return f"json_extract(value, '$.{key}') = ?", [orjson.dumps(value)]
-        elif op == "$gt":
-            # For numeric values, SQLite needs to compare as numbers, not strings
-            if isinstance(value, (int, float)):
-                # Convert to float to handle special values and very large integers
-                return f"CAST(json_extract(value, '$.{key}') AS REAL) > ?", [
-                    float(value)
-                ]
-            elif isinstance(value, str):
-                return f"json_extract(value, '$.{key}') > ?", [value]
-            else:
-                return f"json_extract(value, '$.{key}') > ?", [orjson.dumps(value)]
-        elif op == "$gte":
-            if isinstance(value, (int, float)):
-                return f"CAST(json_extract(value, '$.{key}') AS REAL) >= ?", [
-                    float(value)
-                ]
-            elif isinstance(value, str):
-                return f"json_extract(value, '$.{key}') >= ?", [value]
-            else:
-                return f"json_extract(value, '$.{key}') >= ?", [orjson.dumps(value)]
-        elif op == "$lt":
-            if isinstance(value, (int, float)):
-                return f"CAST(json_extract(value, '$.{key}') AS REAL) < ?", [
-                    float(value)
-                ]
-            elif isinstance(value, str):
-                return f"json_extract(value, '$.{key}') < ?", [value]
-            else:
-                return f"json_extract(value, '$.{key}') < ?", [orjson.dumps(value)]
-        elif op == "$lte":
-            if isinstance(value, (int, float)):
-                return f"CAST(json_extract(value, '$.{key}') AS REAL) <= ?", [
-                    float(value)
-                ]
-            elif isinstance(value, str):
-                return f"json_extract(value, '$.{key}') <= ?", [value]
-            else:
-                return f"json_extract(value, '$.{key}') <= ?", [orjson.dumps(value)]
-        elif op == "$ne":
-            if isinstance(value, str):
-                return f"json_extract(value, '$.{key}') != ?", [value]
-            elif value is None:
-                return f"json_extract(value, '$.{key}') IS NOT NULL", []
-            elif isinstance(value, bool):
-                return f"json_extract(value, '$.{key}') != {1 if value else 0}", []
-            elif isinstance(value, (int, float)):
-                # Convert to float for consistency
-                return f"json_extract(value, '$.{key}') != ?", [float(value)]
-            else:
-                return f"json_extract(value, '$.{key}') != ?", [orjson.dumps(value)]
-        else:
-            raise ValueError(f"Unsupported operator: {op}")
 
     @classmethod
     @contextmanager
