@@ -12,6 +12,12 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10.
 import click
 import pathspec
 
+from langgraph_cli._dockerfile import (
+    add_or_copy,
+    dockerfile_path,
+    dockerfile_text,
+    dockerfile_token,
+)
 from langgraph_cli._ignore import (
     _build_dockerignore_negation_hints,
     _build_ignore_spec,
@@ -72,9 +78,12 @@ class DockerBuildPlan:
     def add_raw(self, line: str) -> None:
         self.lines.append(line)
 
+    def add_comment(self, text: str) -> None:
+        self.lines.append(f"# {dockerfile_text(text, 'Dockerfile comment')}")
+
     def add_instruction(self, opcode: str, value: str | None = None) -> None:
         if value:
-            self.lines.append(f"{opcode} {value}")
+            self.lines.append(f"{opcode} {dockerfile_text(value, opcode + ' value')}")
         else:
             self.lines.append(opcode)
 
@@ -920,23 +929,32 @@ def python_config_to_docker_uv_lock(
         and config_root not in plan.project_root.parents
     ):
         workspace_context_name = "uv-workspace-root"
-        additional_contexts[workspace_context_name] = str(plan.project_root)
+        additional_contexts[workspace_context_name] = dockerfile_text(
+            str(plan.project_root), "Build context path"
+        )
 
     def copy_from_project_root(
         relative_path: pathlib.PurePosixPath, destination: str
     ) -> str:
         if workspace_context_name is not None:
             source = relative_path.as_posix() or "."
-            return f"COPY --from={workspace_context_name} {source} {destination}"
+            return add_or_copy(
+                "COPY",
+                source,
+                destination,
+                flags=(f"--from={workspace_context_name}",),
+            )
 
         source_path = plan.project_root / pathlib.Path(relative_path)
         relative_source = source_path.relative_to(config_root).as_posix()
-        return f"ADD {relative_source} {destination}"
+        return add_or_copy("ADD", relative_source, destination)
 
     uv_export_project_dir = "/tmp/uv_export/project"
     env_vars = _build_runtime_env_vars(config)
 
-    image_str = docker_tag(config, base_image, api_version)
+    image_str = dockerfile_token(
+        docker_tag(config, base_image, api_version), "Base image"
+    )
     docker_plan = DockerBuildPlan(lines=[])
 
     if additional_contexts:
@@ -1011,16 +1029,19 @@ def python_config_to_docker_uv_lock(
     ignore_spec = _build_ignore_spec(plan.project_root, include_gitignore=False)
     for package in plan.install_order:
         package_label = package.root.relative_to(plan.project_root).as_posix() or "."
-        docker_plan.add_raw(f"# -- Adding workspace package {package_label} --")
+        docker_plan.add_comment(f"-- Adding workspace package {package_label} --")
         for source, destination in _uv_lock_package_copy_items(
             package, plan, ignore_spec
         ):
             docker_plan.add_raw(copy_from_project_root(source, destination.as_posix()))
         docker_plan.add_instruction(
-            "WORKDIR", plan.container_roots[package.root].as_posix()
+            "WORKDIR",
+            dockerfile_path(
+                plan.container_roots[package.root].as_posix(), "Working directory"
+            ),
         )
         docker_plan.add_instruction("RUN", f"{global_reqs_pip_install} --no-deps -e .")
-        docker_plan.add_raw(f"# -- End of workspace package {package_label} --")
+        docker_plan.add_comment(f"-- End of workspace package {package_label} --")
         docker_plan.add_blank()
 
     docker_plan.extend_nonempty(env_vars)
@@ -1032,7 +1053,9 @@ def python_config_to_docker_uv_lock(
         docker_plan.add_instruction(
             "ENV", f"NODE_VERSION={config.get('node_version') or DEFAULT_NODE_VERSION}"
         )
-        docker_plan.add_instruction("WORKDIR", plan.working_dir)
+        docker_plan.add_instruction(
+            "WORKDIR", dockerfile_path(plan.working_dir, "Working directory")
+        )
         docker_plan.add_instruction(
             "RUN",
             f"{_get_node_pm_install_cmd(plan.target_root)} && "
@@ -1050,6 +1073,8 @@ def python_config_to_docker_uv_lock(
     )
     docker_plan.add_blank()
     if plan.working_dir:
-        docker_plan.add_instruction("WORKDIR", plan.working_dir)
+        docker_plan.add_instruction(
+            "WORKDIR", dockerfile_path(plan.working_dir, "Working directory")
+        )
 
     return docker_plan.render(), additional_contexts

@@ -11,6 +11,12 @@ from typing import Literal, NamedTuple
 import click
 import httpx
 
+from langgraph_cli._dockerfile import (
+    add_or_copy,
+    dockerfile_path,
+    dockerfile_text,
+    dockerfile_token,
+)
 from langgraph_cli.schemas import Config, Distros
 from langgraph_cli.uv_lock import python_config_to_docker_uv_lock
 
@@ -1122,43 +1128,49 @@ def _build_python_install_commands(
         )
 
     pip_config_file_str = (
-        f"ADD {config['pip_config_file']} /pipconfig.txt"
+        add_or_copy("ADD", config["pip_config_file"], "/pipconfig.txt")
         if config.get("pip_config_file")
         else ""
     )
     return local_reqs_pip_install, global_reqs_pip_install, pip_config_file_str
 
 
+def _env_json(value: object) -> str:
+    # The JSON is written inside a single-quoted ENV value, where Docker has no
+    # escape for `'`; `\u0027` keeps a `'` in the data from closing the quote.
+    return json.dumps(value).replace("'", "\\u0027")
+
+
 def _build_runtime_env_vars(config: Config) -> list[str]:
     env_vars = []
 
     if (store_config := config.get("store")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_STORE='{json.dumps(store_config)}'")
+        env_vars.append(f"ENV LANGGRAPH_STORE='{_env_json(store_config)}'")
 
     if (auth_config := config.get("auth")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_AUTH='{json.dumps(auth_config)}'")
+        env_vars.append(f"ENV LANGGRAPH_AUTH='{_env_json(auth_config)}'")
 
     if (encryption_config := config.get("encryption")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_ENCRYPTION='{json.dumps(encryption_config)}'")
+        env_vars.append(f"ENV LANGGRAPH_ENCRYPTION='{_env_json(encryption_config)}'")
 
     if (http_config := config.get("http")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_HTTP='{json.dumps(http_config)}'")
+        env_vars.append(f"ENV LANGGRAPH_HTTP='{_env_json(http_config)}'")
 
     if (webhooks_config := config.get("webhooks")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_WEBHOOKS='{json.dumps(webhooks_config)}'")
+        env_vars.append(f"ENV LANGGRAPH_WEBHOOKS='{_env_json(webhooks_config)}'")
 
     if (checkpointer_config := config.get("checkpointer")) is not None:
         env_vars.append(
-            f"ENV LANGGRAPH_CHECKPOINTER='{json.dumps(checkpointer_config)}'"
+            f"ENV LANGGRAPH_CHECKPOINTER='{_env_json(checkpointer_config)}'"
         )
 
     if (ui := config.get("ui")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_UI='{json.dumps(ui)}'")
+        env_vars.append(f"ENV LANGGRAPH_UI='{_env_json(ui)}'")
 
     if (ui_config := config.get("ui_config")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_UI_CONFIG='{json.dumps(ui_config)}'")
+        env_vars.append(f"ENV LANGGRAPH_UI_CONFIG='{_env_json(ui_config)}'")
 
-    env_vars.append(f"ENV LANGSERVE_GRAPHS='{json.dumps(config['graphs'])}'")
+    env_vars.append(f"ENV LANGSERVE_GRAPHS='{_env_json(config['graphs'])}'")
     return env_vars
 
 
@@ -1312,19 +1324,33 @@ def python_config_to_docker(
     # Rewrite HTTP app path, so it points to the correct location in the Docker container
     _update_http_app_path(config_path, config, local_deps)
 
+    for dep in pypi_deps:
+        dockerfile_text(dep, "Dependency")
+        if "\\" in dep:
+            raise click.UsageError(
+                f"Dependency {dep!r} contains '\\', which cannot be written "
+                "into a Dockerfile RUN instruction."
+            )
     pip_pkgs_str = (
         f"RUN {local_reqs_pip_install} {' '.join(pypi_deps)}" if pypi_deps else ""
     )
     if local_deps.pip_reqs:
         pip_reqs_str = os.linesep.join(
             (
-                f"COPY --from=outer-{reqpath.name} requirements.txt {destpath}"
+                add_or_copy(
+                    "COPY",
+                    "requirements.txt",
+                    destpath,
+                    flags=(f"--from=outer-{reqpath.name}",),
+                )
                 if reqpath.parent in local_deps.additional_contexts
-                else f"ADD {reqpath.relative_to(config_path.parent)} {destpath}"
+                else add_or_copy(
+                    "ADD", reqpath.relative_to(config_path.parent).as_posix(), destpath
+                )
             )
             for reqpath, destpath in local_deps.pip_reqs
         )
-        pip_reqs_str += f"{os.linesep}RUN {local_reqs_pip_install} {' '.join('-r ' + r for _, r in local_deps.pip_reqs)}"
+        pip_reqs_str += f"{os.linesep}RUN {local_reqs_pip_install} {' '.join('-r ' + shlex.quote(r) for _, r in local_deps.pip_reqs)}"
         pip_reqs_str = f"""# -- Installing local requirements --
 {pip_reqs_str}
 # -- End of local requirements install --"""
@@ -1334,42 +1360,51 @@ def python_config_to_docker(
 
     # https://setuptools.pypa.io/en/latest/userguide/datafiles.html#package-data
     # https://til.simonwillison.net/python/pyproject
-    faux_pkgs_str = f"{os.linesep}{os.linesep}".join(
-        (
-            f"""# -- Adding non-package dependency {fullpath.name} --
-COPY --from=outer-{fullpath.name} . {destpath}"""
-            if fullpath in local_deps.additional_contexts
-            else f"""# -- Adding non-package dependency {fullpath.name} --
-ADD {relpath} {destpath}"""
-        )
-        + f"""
+    faux_pkg_blocks = []
+    for fullpath, (relpath, destpath) in local_deps.faux_pkgs.items():
+        # The name is also written inside shell single quotes and a TOML string.
+        pkg_name = dockerfile_path(fullpath.name, "Local dependency directory name")
+        if fullpath in local_deps.additional_contexts:
+            context_name = dockerfile_token(f"outer-{pkg_name}", "Build context name")
+            add_str = add_or_copy(
+                "COPY", ".", destpath, flags=(f"--from={context_name}",)
+            )
+        else:
+            add_str = add_or_copy("ADD", relpath, destpath)
+        faux_pkg_blocks.append(
+            f"""# -- Adding non-package dependency {pkg_name} --
+{add_str}
 RUN set -ex && \\
     for line in '[project]' \\
-                'name = "{fullpath.name}"' \\
+                'name = "{pkg_name}"' \\
                 'version = "0.1"' \\
                 '[tool.setuptools.package-data]' \\
                 '"*" = ["**/*"]' \\
                 '[build-system]' \\
                 'requires = ["setuptools>=61"]' \\
                 'build-backend = "setuptools.build_meta"'; do \\
-        echo "$line" >> {shlex.quote(f"/deps/outer-{fullpath.name}/pyproject.toml")}; \\
+        echo "$line" >> {shlex.quote(f"/deps/outer-{pkg_name}/pyproject.toml")}; \\
     done
-# -- End of non-package dependency {fullpath.name} --"""
-        for fullpath, (relpath, destpath) in local_deps.faux_pkgs.items()
-    )
+# -- End of non-package dependency {pkg_name} --"""
+        )
+    faux_pkgs_str = f"{os.linesep}{os.linesep}".join(faux_pkg_blocks)
 
-    local_pkgs_str = os.linesep.join(
-        (
+    local_pkg_blocks = []
+    for fullpath, (relpath, name) in local_deps.real_pkgs.items():
+        relpath = dockerfile_path(relpath, "Local dependency path")
+        if fullpath in local_deps.additional_contexts:
+            context_name = dockerfile_token(name, "Build context name")
+            add_str = add_or_copy(
+                "COPY", ".", f"/deps/{name}", flags=(f"--from={context_name}",)
+            )
+        else:
+            add_str = add_or_copy("ADD", relpath, f"/deps/{name}")
+        local_pkg_blocks.append(
             f"""# -- Adding local package {relpath} --
-COPY --from={name} . /deps/{name}
-# -- End of local package {relpath} --"""
-            if fullpath in local_deps.additional_contexts
-            else f"""# -- Adding local package {relpath} --
-ADD {relpath} /deps/{name}
+{add_str}
 # -- End of local package {relpath} --"""
         )
-        for fullpath, (relpath, name) in local_deps.real_pkgs.items()
-    )
+    local_pkgs_str = os.linesep.join(local_pkg_blocks)
 
     additional_contexts: dict[str, str] = {}
     additional_context_names: dict[pathlib.Path, str] = {}
@@ -1387,7 +1422,7 @@ ADD {relpath} /deps/{name}
 
         used_context_names.add(name)
         additional_context_names[path] = name
-        additional_contexts[name] = str(path)
+        additional_contexts[name] = dockerfile_text(str(path), "Build context path")
         return name
 
     for p in local_deps.additional_contexts:
@@ -1422,12 +1457,14 @@ ADD {relpath} /deps/{name}
             [
                 "# -- Installing JS dependencies --",
                 f"ENV NODE_VERSION={config.get('node_version') or DEFAULT_NODE_VERSION}",
-                f"WORKDIR {local_deps.working_dir}",
+                f"WORKDIR {dockerfile_path(local_deps.working_dir, 'Working directory')}",
                 f"RUN {_get_node_pm_install_cmd(config_path.parent)} && tsx /api/langgraph_api/js/build.mts",
                 "# -- End of JS dependencies install --",
             ]
         )
-    image_str = docker_tag(config, base_image, api_version)
+    image_str = dockerfile_token(
+        docker_tag(config, base_image, api_version), "Base image"
+    )
 
     # Prepare docker file contents
     docker_file_contents = []
@@ -1472,7 +1509,9 @@ ADD {relpath} /deps/{name}
                 pip_installer=pip_installer,
             ),
             "",
-            f"WORKDIR {local_deps.working_dir}" if local_deps.working_dir else "",
+            f"WORKDIR {dockerfile_path(local_deps.working_dir, 'Working directory')}"
+            if local_deps.working_dir
+            else "",
         ]
     )
 
@@ -1504,7 +1543,9 @@ def node_config_to_docker(
         # Backward compatibility: use the original behavior
         faux_path = f"/deps/{config_path.parent.name}"
 
-    image_str = docker_tag(config, base_image, api_version)
+    image_str = dockerfile_token(
+        docker_tag(config, base_image, api_version), "Base image"
+    )
 
     env_vars = _build_runtime_env_vars(config)
 
@@ -1535,15 +1576,15 @@ def node_config_to_docker(
         "",
         os.linesep.join(config["dockerfile_lines"]),
         "",
-        f"ADD . {faux_path if not build_context else container_root}",
+        add_or_copy("ADD", ".", faux_path if not build_context else container_root),
         "",
-        f"WORKDIR {install_workdir}",
+        f"WORKDIR {dockerfile_path(install_workdir, 'Working directory')}",
         "",
         install_step,
         "",
         os.linesep.join(env_vars),
         "",
-        f"WORKDIR {build_workdir}",
+        f"WORKDIR {dockerfile_path(build_workdir, 'Working directory')}",
         "",
         build_step,
     ]
@@ -1607,7 +1648,7 @@ def _calculate_relative_workdir(config_path: pathlib.Path, build_context: str) -
 
     try:
         relative_path = config_dir.relative_to(build_context_path)
-        return str(relative_path) if str(relative_path) != "." else ""
+        return relative_path.as_posix() if str(relative_path) != "." else ""
     except ValueError as _:
         raise ValueError(
             f"Configuration file {config_path} is not under the build context {build_context}. "
@@ -1660,9 +1701,14 @@ def config_to_compose(
     base_image = base_image or default_base_image(config)
 
     env_vars = config["env"].items() if isinstance(config["env"], dict) else {}
-    env_vars_str = "\n".join(f'            {k}: "{v}"' for k, v in env_vars)
+    env_vars_str = "\n".join(
+        f'            {dockerfile_text(str(k), "env key")}: "{dockerfile_text(str(v), "env value")}"'
+        for k, v in env_vars
+    )
     env_file_str = (
-        f"env_file: {config['env']}" if isinstance(config["env"], str) else ""
+        f"env_file: {dockerfile_text(config['env'], 'env file')}"
+        if isinstance(config["env"], str)
+        else ""
     )
     if watch:
         dependencies = config.get("dependencies") or ["."]
@@ -1670,7 +1716,7 @@ def config_to_compose(
             dep for dep in dependencies if dep.startswith(".")
         ]
         watch_actions = "\n".join(
-            f"""- path: {path}
+            f"""- path: {dockerfile_text(path, "Watch path")}
   action: rebuild"""
             for path in watch_paths
         )
@@ -1703,7 +1749,8 @@ def config_to_compose(
         )
 
         additional_contexts_str = "\n".join(
-            f"                - {name}: {path}"
+            f"                - {dockerfile_token(name, 'Build context name')}: "
+            f"{dockerfile_text(path, 'Build context path')}"
             for name, path in additional_contexts.items()
         )
         if additional_contexts_str:
@@ -1735,7 +1782,8 @@ def config_to_compose(
             )
 
             executor_additional_contexts_str = "\n".join(
-                f"                    - {name}: {path}"
+                f"                    - {dockerfile_token(name, 'Build context name')}: "
+                f"{dockerfile_text(path, 'Build context path')}"
                 for name, path in executor_additional_contexts.items()
             )
             if executor_additional_contexts_str:
