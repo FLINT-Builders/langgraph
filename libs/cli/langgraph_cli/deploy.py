@@ -606,8 +606,15 @@ def _resolve_deployment(
     name: str | None,
     *,
     not_found_message: str,
+    confirm_existing: bool = False,
 ) -> tuple[str | None, bool, int]:
-    """Resolve an existing deployment by ID or exact name match."""
+    """Resolve an existing deployment by ID or exact name match.
+
+    When `confirm_existing` is set, a deployment found by name is only
+    returned after the operator confirms its name and ID. The returned ID is
+    the one that was confirmed, so callers must act on it rather than looking
+    the name up again.
+    """
     needs_creation = False
     if deployment_id:
         _log_deploy_step(step, f"Using deployment {deployment_id}")
@@ -624,6 +631,19 @@ def _resolve_deployment(
     if found_id:
         deployment_id = str(found_id)
         em.info(f"Found existing deployment (ID: {deployment_id})")
+        if confirm_existing:
+            if _no_input:
+                raise click.ClickException(
+                    f"Deployment '{name}' (ID: {deployment_id}) already exists. "
+                    "Pass --name or --deployment-id explicitly to update it "
+                    "with --no-input."
+                )
+            if not click.confirm(
+                f"Replace existing deployment '{name}' (ID: {deployment_id}) "
+                "with this project?",
+                default=False,
+            ):
+                raise click.Abort()
     else:
         needs_creation = True
         em.warn(not_found_message)
@@ -1332,8 +1352,9 @@ OPT_HOST_DEPLOYMENT_NAME = click.option(
     envvar=_DEPLOYMENT_NAME_ENV,
     help=(
         "Deployment name. Can also be set via LANGSMITH_DEPLOYMENT_NAME "
-        "environment variable or .env file. Defaults to current directory name "
-        "if --deployment-id is not provided."
+        "environment variable. A LANGSMITH_DEPLOYMENT_NAME value in the project "
+        ".env file is only offered as the default when prompting. Defaults to "
+        "current directory name if --deployment-id is not provided."
     ),
 )
 
@@ -1618,21 +1639,27 @@ def _deploy_cmd(
 
     env_vars = _parse_env_from_config(config_json, config)
 
+    # `--name`, `--deployment-id`, and LANGSMITH_DEPLOYMENT_NAME in the process
+    # environment come from the operator. A name in the project's env file or
+    # langgraph.json is repository content, so it is only offered as the prompt
+    # default and never selects a deployment on its own.
+    id_selected = bool(deployment_id)
+    operator_selected = bool(deployment_id or name)
     if not deployment_id and not name:
-        name = env_vars.get(_DEPLOYMENT_NAME_ENV)
-    if not deployment_id and not name:
-        default_name = normalize_name(pathlib.Path.cwd().name)
+        project_name = env_vars.get(_DEPLOYMENT_NAME_ENV)
         if no_input:
-            name = default_name
+            if project_name:
+                raise click.UsageError(
+                    f"{_DEPLOYMENT_NAME_ENV} is set in the project env, which "
+                    "cannot select the deployment with --no-input. Pass --name "
+                    "or --deployment-id explicitly."
+                )
+            name = normalize_name(pathlib.Path.cwd().name)
         else:
+            default_name = normalize_name(project_name or pathlib.Path.cwd().name)
             name = click.prompt("Deployment name", default=default_name)
     if name and not deployment_id:
         name = normalize_name(name)
-        if not no_input:
-            env_path = _resolve_env_path(config_json, config)
-            if env_path is not None:
-                set_key(str(env_path), _DEPLOYMENT_NAME_ENV, name)
-                em.info(f"Saved deployment name to {env_path}")
 
     secrets = _secrets_from_env(_env_without_deployment_name(env_vars))
 
@@ -1661,7 +1688,14 @@ def _deploy_cmd(
             if use_remote_build
             else "No deployment found. Will create after build."
         ),
+        confirm_existing=not operator_selected,
     )
+
+    if name and not no_input and not id_selected:
+        env_path = _resolve_env_path(config_json, config)
+        if env_path is not None:
+            set_key(str(env_path), _DEPLOYMENT_NAME_ENV, name)
+            em.info(f"Saved deployment name to {env_path}")
 
     if needs_creation:
         deployment_id, step = _create_deployment(
@@ -1986,7 +2020,9 @@ def deploy_logs(
     env_vars = _parse_env_from_config({}, pathlib.Path.cwd() / DEFAULT_CONFIG)
     client = _create_host_backend_client(host_url, api_key, env_vars=env_vars)
     if not deployment_id and not name:
-        name = env_vars.get(_DEPLOYMENT_NAME_ENV)
+        project_name = env_vars.get(_DEPLOYMENT_NAME_ENV)
+        if project_name:
+            name = click.prompt("Deployment name", default=project_name)
     validate_deployment_selector(deployment_id, name)
     if deployment_id:
         dep_id = deployment_id
