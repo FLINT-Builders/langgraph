@@ -126,7 +126,7 @@ from langgraph.pregel._algo import (
     local_read,
     prepare_next_tasks,
 )
-from langgraph.pregel._call import identifier
+from langgraph.pregel._call import cache_identifier
 from langgraph.pregel._checkpoint import (
     achannels_from_checkpoint,
     channels_from_checkpoint,
@@ -4145,7 +4145,7 @@ class Pregel(
                 namespaces.append(
                     (
                         CACHE_NS_WRITES,
-                        (identifier(self.nodes[node]) or "__dynamic__"),
+                        cache_identifier(self.nodes[node]),
                         node,
                     ),
                 )
@@ -4164,7 +4164,7 @@ class Pregel(
                 namespaces.append(
                     (
                         CACHE_NS_WRITES,
-                        (identifier(self.nodes[node]) or "__dynamic__"),
+                        cache_identifier(self.nodes[node]),
                         node,
                     ),
                 )

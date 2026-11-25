@@ -38,8 +38,8 @@ from langgraph.pregel._call import (
     SyncAsyncFuture,
     T,
     _call_with_options,
+    cache_identifier,
     get_runnable_for_entrypoint,
-    identifier,
 )
 from langgraph.pregel._read import PregelNode
 from langgraph.pregel._write import ChannelWrite, ChannelWriteEntry
@@ -96,14 +96,12 @@ class _TaskFunction(Generic[P, T]):
     def clear_cache(self, cache: BaseCache) -> None:
         """Clear the cache for this task."""
         if self.cache_policy is not None:
-            cache.clear(((CACHE_NS_WRITES, identifier(self.func) or "__dynamic__"),))
+            cache.clear(((CACHE_NS_WRITES, cache_identifier(self.func)),))
 
     async def aclear_cache(self, cache: BaseCache) -> None:
         """Clear the cache for this task."""
         if self.cache_policy is not None:
-            await cache.aclear(
-                ((CACHE_NS_WRITES, identifier(self.func) or "__dynamic__"),)
-            )
+            await cache.aclear(((CACHE_NS_WRITES, cache_identifier(self.func)),))
 
 
 @overload
