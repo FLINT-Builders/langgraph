@@ -25,6 +25,11 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from langgraph.checkpoint.base import DeltaChannelHistory, PendingWrite
+from langgraph.checkpoint.serde.base import (
+    checkpoint_context,
+    loads_typed_bound,
+    write_context,
+)
 
 # Stage 1 streams ancestors of `target_cid` newest-first. The `<=`
 # predicate keeps target itself in the stream so we can read its
@@ -72,6 +77,8 @@ def step_walk_with_row(
     type_tag: str,
     blob: bytes,
     target_id: str,
+    thread_id: str,
+    checkpoint_ns: str,
     serde: Any,
     chain_by_ch: dict[str, list[str]],
     seed_val_by_ch: dict[str, Any],
@@ -113,7 +120,9 @@ def step_walk_with_row(
         return False
     for ch in active:
         chain_by_ch[ch].append(cid)
-    ckpt = serde.loads_typed((type_tag, blob))
+    ckpt = loads_typed_bound(
+        serde, (type_tag, blob), checkpoint_context(thread_id, checkpoint_ns, cid)
+    )
     channel_values: Mapping[str, Any] = ckpt.get("channel_values") or {}
     for ch in [ch for ch in active if ch in channel_values]:
         seed_val_by_ch[ch] = channel_values[ch]
@@ -126,6 +135,8 @@ def step_walk_with_row(
 
 def build_delta_channels_writes_history(
     *,
+    thread_id: str,
+    checkpoint_ns: str,
     channels: Sequence[str],
     chain_by_ch: Mapping[str, list[str]],
     seed_val_by_ch: Mapping[str, Any],
@@ -161,10 +172,13 @@ def build_delta_channels_writes_history(
         collected: list[PendingWrite] = []
         # Chain is newest-first; iterate oldest-first for the public order.
         for cid in reversed(chain_cids):
-            for type_tag, value_blob, task_id, _idx in cid_writes.get(cid, []):
-                collected.append(
-                    (task_id, ch, serde.loads_typed((type_tag, value_blob)))
+            for type_tag, value_blob, task_id, idx in cid_writes.get(cid, []):
+                value = loads_typed_bound(
+                    serde,
+                    (type_tag, value_blob),
+                    write_context(thread_id, checkpoint_ns, cid, task_id, idx, ch),
                 )
+                collected.append((task_id, ch, value))
         entry: DeltaChannelHistory = {"writes": collected}
         if ch in seeded:
             entry["seed"] = seed_val_by_ch[ch]

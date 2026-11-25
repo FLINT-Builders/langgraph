@@ -22,6 +22,12 @@ from langgraph.checkpoint.base import (
     get_checkpoint_id,
     get_checkpoint_metadata,
 )
+from langgraph.checkpoint.serde.base import (
+    checkpoint_context,
+    dumps_typed_bound,
+    loads_typed_bound,
+    write_context,
+)
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from langgraph.checkpoint.sqlite._delta import (
@@ -395,7 +401,7 @@ class AsyncSqliteSaver(BaseCheckpointSaver[str]):
                     }
                 # find any pending writes
                 await cur.execute(
-                    "SELECT task_id, channel, type, value FROM writes WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ? ORDER BY task_id, idx",
+                    "SELECT task_id, channel, type, value, idx FROM writes WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ? ORDER BY task_id, idx",
                     (
                         str(config["configurable"]["thread_id"]),
                         checkpoint_ns,
@@ -405,7 +411,11 @@ class AsyncSqliteSaver(BaseCheckpointSaver[str]):
                 # deserialize the checkpoint and metadata
                 return CheckpointTuple(
                     config,
-                    self.serde.loads_typed((type, checkpoint)),
+                    loads_typed_bound(
+                        self.serde,
+                        (type, checkpoint),
+                        checkpoint_context(thread_id, checkpoint_ns, checkpoint_id),
+                    ),
                     cast(
                         CheckpointMetadata,
                         (json.loads(metadata) if metadata is not None else {}),
@@ -422,8 +432,23 @@ class AsyncSqliteSaver(BaseCheckpointSaver[str]):
                         else None
                     ),
                     [
-                        (task_id, channel, self.serde.loads_typed((type, value)))
-                        async for task_id, channel, type, value in cur
+                        (
+                            task_id,
+                            channel,
+                            loads_typed_bound(
+                                self.serde,
+                                (type, value),
+                                write_context(
+                                    thread_id,
+                                    checkpoint_ns,
+                                    checkpoint_id,
+                                    task_id,
+                                    idx,
+                                    channel,
+                                ),
+                            ),
+                        )
+                        async for task_id, channel, type, value, idx in cur
                     ],
                 )
 
@@ -473,7 +498,7 @@ class AsyncSqliteSaver(BaseCheckpointSaver[str]):
                 metadata,
             ) in cur:
                 await wcur.execute(
-                    "SELECT task_id, channel, type, value FROM writes WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ? ORDER BY task_id, idx",
+                    "SELECT task_id, channel, type, value, idx FROM writes WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ? ORDER BY task_id, idx",
                     (thread_id, checkpoint_ns, checkpoint_id),
                 )
                 yield CheckpointTuple(
@@ -484,7 +509,11 @@ class AsyncSqliteSaver(BaseCheckpointSaver[str]):
                             "checkpoint_id": checkpoint_id,
                         }
                     },
-                    self.serde.loads_typed((type, checkpoint)),
+                    loads_typed_bound(
+                        self.serde,
+                        (type, checkpoint),
+                        checkpoint_context(thread_id, checkpoint_ns, checkpoint_id),
+                    ),
                     cast(
                         CheckpointMetadata,
                         (json.loads(metadata) if metadata is not None else {}),
@@ -501,8 +530,23 @@ class AsyncSqliteSaver(BaseCheckpointSaver[str]):
                         else None
                     ),
                     [
-                        (task_id, channel, self.serde.loads_typed((type, value)))
-                        async for task_id, channel, type, value in wcur
+                        (
+                            task_id,
+                            channel,
+                            loads_typed_bound(
+                                self.serde,
+                                (type, value),
+                                write_context(
+                                    thread_id,
+                                    checkpoint_ns,
+                                    checkpoint_id,
+                                    task_id,
+                                    idx,
+                                    channel,
+                                ),
+                            ),
+                        )
+                        async for task_id, channel, type, value, idx in wcur
                     ],
                 )
 
@@ -530,7 +574,11 @@ class AsyncSqliteSaver(BaseCheckpointSaver[str]):
         await self.setup()
         thread_id = config["configurable"]["thread_id"]
         checkpoint_ns = config["configurable"]["checkpoint_ns"]
-        type_, serialized_checkpoint = self.serde.dumps_typed(checkpoint)
+        type_, serialized_checkpoint = dumps_typed_bound(
+            self.serde,
+            checkpoint,
+            checkpoint_context(str(thread_id), checkpoint_ns, checkpoint["id"]),
+        )
         serialized_metadata = json.dumps(
             get_checkpoint_metadata(config, metadata), ensure_ascii=False
         ).encode("utf-8", "ignore")
@@ -592,7 +640,18 @@ class AsyncSqliteSaver(BaseCheckpointSaver[str]):
                         task_id,
                         WRITES_IDX_MAP.get(channel, idx),
                         channel,
-                        *self.serde.dumps_typed(value),
+                        *dumps_typed_bound(
+                            self.serde,
+                            value,
+                            write_context(
+                                str(config["configurable"]["thread_id"]),
+                                str(config["configurable"]["checkpoint_ns"]),
+                                str(config["configurable"]["checkpoint_id"]),
+                                task_id,
+                                WRITES_IDX_MAP.get(channel, idx),
+                                channel,
+                            ),
+                        ),
                     )
                     for idx, (channel, value) in enumerate(writes)
                 ],
@@ -660,6 +719,8 @@ class AsyncSqliteSaver(BaseCheckpointSaver[str]):
                     type_tag=type_tag,
                     blob=blob,
                     target_id=checkpoint_id,
+                    thread_id=thread_id,
+                    checkpoint_ns=checkpoint_ns,
                     serde=self.serde,
                     chain_by_ch=chain_by_ch,
                     seed_val_by_ch=seed_val_by_ch,
@@ -688,6 +749,8 @@ class AsyncSqliteSaver(BaseCheckpointSaver[str]):
                 stage2_rows = []
 
         return build_delta_channels_writes_history(
+            thread_id=thread_id,
+            checkpoint_ns=checkpoint_ns,
             channels=channels,
             chain_by_ch=chain_by_ch,
             seed_val_by_ch=seed_val_by_ch,
