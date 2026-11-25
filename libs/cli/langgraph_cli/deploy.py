@@ -84,6 +84,8 @@ _API_KEY_ENV_NAMES = (
     "LANGCHAIN_API_KEY",
 )
 
+_TENANT_ID_ENV = "LANGSMITH_TENANT_ID"
+
 _DEPLOYMENT_NAME_ENV = "LANGSMITH_DEPLOYMENT_NAME"
 
 _TERMINAL_STATUSES = frozenset(
@@ -1236,32 +1238,84 @@ def _create_host_backend_client(
 ) -> HostBackendClient:
     if env_vars is None:
         env_vars = _parse_env_from_config({}, pathlib.Path.cwd() / DEFAULT_CONFIG)
-    resolved_api_key = api_key
-    if not resolved_api_key:
-        for key_name in _API_KEY_ENV_NAMES:
-            val = env_vars.get(key_name)
-            if val:
-                resolved_api_key = val
-                break
-            val = os.environ.get(key_name)
-            if val:
-                resolved_api_key = val
-                break
-    if not resolved_api_key:
+    resolved_api_key, tenant_id = _resolve_host_credentials(api_key, env_vars)
+    return HostBackendClient(host_url, resolved_api_key, tenant_id=tenant_id)
+
+
+def _resolve_host_credentials(
+    api_key: str | None, env_vars: dict[str, str]
+) -> tuple[str, str | None]:
+    """Resolve the API key and workspace ID used to authenticate to the host.
+
+    `env_vars` comes from the project (langgraph.json `env` or an env file),
+    which whoever controls the project can edit. The `--api-key` flag and the
+    process environment belong to the operator and always take precedence.
+    A project API key is only used when the operator has no key of their own
+    and explicitly confirms it, because it decides which LangSmith account
+    receives the source archive and deployment secrets.
+    """
+    em = _get_emitter()
+    project_keys = [
+        (name, env_vars[name]) for name in _API_KEY_ENV_NAMES if env_vars.get(name)
+    ]
+    project_tenant_id = env_vars.get(_TENANT_ID_ENV) or None
+    process_tenant_id = os.environ.get(_TENANT_ID_ENV) or None
+
+    resolved_api_key = api_key or next(
+        (os.environ[name] for name in _API_KEY_ENV_NAMES if os.environ.get(name)),
+        None,
+    )
+    key_from_project = False
+    if resolved_api_key:
+        for name, _ in project_keys:
+            em.note(
+                f"Warning: {name} from the project env was ignored; "
+                "using the API key from --api-key or your environment."
+            )
+    elif project_keys:
+        name, value = project_keys[0]
+        hint = (
+            "Set LANGSMITH_API_KEY in your environment or pass --api-key to "
+            "use your own LangSmith account."
+        )
+        if _no_input:
+            raise click.ClickException(
+                f"Refusing to use {name} from the project env (langgraph.json "
+                f"or .env file) without confirmation. {hint}"
+            )
+        if not click.confirm(
+            f"No LangSmith API key is set in your environment. The project env "
+            f"(langgraph.json or .env file) provides {name}; the source code and "
+            "secrets will be sent to the LangSmith account that owns that key. "
+            "Use the project API key?",
+            default=False,
+        ):
+            raise click.ClickException(
+                f"Did not use {name} from the project env. {hint}"
+            )
+        resolved_api_key = value
+        key_from_project = True
+    else:
         if _no_input:
             raise click.ClickException(
                 "No LangSmith API key found. Set LANGSMITH_API_KEY in the "
-                "environment or .env file."
+                "environment or pass --api-key."
             )
         click.secho(
             "No LangSmith API key found. Create one at Settings > API Keys in LangSmith.",
             fg="yellow",
         )
         resolved_api_key = click.prompt("Enter LangSmith API key", hide_input=True)
-    tenant_id = env_vars.get("LANGSMITH_TENANT_ID") or os.environ.get(
-        "LANGSMITH_TENANT_ID"
-    )
-    return HostBackendClient(host_url, resolved_api_key, tenant_id=tenant_id)
+
+    tenant_id = process_tenant_id
+    if project_tenant_id and not process_tenant_id and key_from_project:
+        tenant_id = project_tenant_id
+    elif project_tenant_id and project_tenant_id != tenant_id:
+        em.note(
+            f"Warning: {_TENANT_ID_ENV} from the project env was ignored; "
+            "set it in your environment to choose a workspace."
+        )
+    return resolved_api_key, tenant_id
 
 
 def _call_host_backend_with_optional_tenant(
@@ -1289,7 +1343,7 @@ def _call_host_backend_with_optional_tenant(
                 if _no_input:
                     raise click.ClickException(
                         "API key is org-scoped and requires a workspace ID. "
-                        "Set LANGSMITH_TENANT_ID in your .env file or "
+                        "Set LANGSMITH_TENANT_ID in your environment or "
                         "use a workspace-scoped API key."
                     ) from None
                 click.secho(
@@ -1323,7 +1377,8 @@ OPT_HOST_API_KEY = click.option(
     envvar="LANGGRAPH_HOST_API_KEY",
     help=(
         "API key. Can also be set via LANGGRAPH_HOST_API_KEY, "
-        "LANGSMITH_API_KEY, or LANGCHAIN_API_KEY environment variable or .env file."
+        "LANGSMITH_API_KEY, or LANGCHAIN_API_KEY environment variable. A key in "
+        "the project .env file is only used after confirmation."
     ),
 )
 
@@ -1618,6 +1673,21 @@ def _deploy_cmd(
 
     env_vars = _parse_env_from_config(config_json, config)
 
+    if image and remote_build_flag is True:
+        raise click.UsageError("--image cannot be combined with --remote builds.")
+
+    use_remote_build, local_build_error = _resolve_build_mode(
+        remote_build_flag, force_local=image is not None
+    )
+    if use_remote_build and remote_build_flag is None and local_build_error:
+        em.note(f"{local_build_error}\nUsing remote build instead.")
+        if not json_output:
+            click.echo()
+
+    # Credentials are settled before anything is written to the project env
+    # file or sent to the host.
+    client = _create_host_backend_client(host_url, api_key, env_vars=env_vars)
+
     if not deployment_id and not name:
         name = env_vars.get(_DEPLOYMENT_NAME_ENV)
     if not deployment_id and not name:
@@ -1636,19 +1706,7 @@ def _deploy_cmd(
 
     secrets = _secrets_from_env(_env_without_deployment_name(env_vars))
 
-    if image and remote_build_flag is True:
-        raise click.UsageError("--image cannot be combined with --remote builds.")
-
-    use_remote_build, local_build_error = _resolve_build_mode(
-        remote_build_flag, force_local=image is not None
-    )
-    if use_remote_build and remote_build_flag is None and local_build_error:
-        em.note(f"{local_build_error}\nUsing remote build instead.")
-        if not json_output:
-            click.echo()
-
     # -- 2. Resolve / create deployment --
-    client = _create_host_backend_client(host_url, api_key, env_vars=env_vars)
     step = 1
 
     deployment_id, needs_creation, step = _resolve_deployment(
