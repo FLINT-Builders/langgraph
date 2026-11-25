@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import json
 import logging
+import math
 import re
 import threading
 from collections import defaultdict
@@ -650,14 +651,8 @@ class BasePostgresStore(Generic[C]):
         """Helper to generate filter conditions."""
         if op == "$eq":
             return "value->%s = %s::jsonb", [key, json.dumps(value)]
-        elif op == "$gt":
-            return "value->>%s > %s", [key, str(value)]
-        elif op == "$gte":
-            return "value->>%s >= %s", [key, str(value)]
-        elif op == "$lt":
-            return "value->>%s < %s", [key, str(value)]
-        elif op == "$lte":
-            return "value->>%s <= %s", [key, str(value)]
+        elif op in _COMPARISON_OPERATORS:
+            return _comparison_condition(key, op, value)
         elif op == "$ne":
             return "value->%s != %s::jsonb", [key, json.dumps(value)]
         else:
@@ -1326,6 +1321,39 @@ def _namespace_match_pattern(path: tuple[str, ...], match_type: str) -> str:
     if match_type == "suffix":
         return rf"(^|\.){body}\Z"
     return rf"^{body}(\.|\Z)"
+
+
+_COMPARISON_OPERATORS = {"$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<="}
+
+
+def _comparison_condition(key: str, op: str, value: Any) -> tuple[str, list]:
+    """Build a `$gt`/`$gte`/`$lt`/`$lte` condition that never mixes JSON types.
+
+    Numbers compare numerically and only against stored JSON numbers; strings
+    compare as text and only against stored JSON strings. Any other stored type,
+    or a missing field, yields NULL and does not match.
+    """
+    sql_op = _COMPARISON_OPERATORS[op]
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(
+            f"Unsupported value for {op} filter on {key!r}: expected a number "
+            f"or string, got {type(value).__name__}"
+        )
+    if isinstance(value, str):
+        return (
+            "(CASE WHEN jsonb_typeof(value->%s) = 'string' "
+            f"THEN value->>%s END) {sql_op} %s"
+        ), [key, key, value]
+    if isinstance(value, float) and not math.isfinite(value):
+        # JSON cannot hold NaN or infinities, and older Postgres versions have
+        # no numeric infinity, so resolve these bounds without a cast.
+        if math.isnan(value) or (value > 0) == (op in ("$gt", "$gte")):
+            return "FALSE", []
+        return "jsonb_typeof(value->%s) = 'number'", [key]
+    return (
+        "(CASE WHEN jsonb_typeof(value->%s) = 'number' "
+        f"THEN (value->>%s)::numeric END) {sql_op} %s::numeric"
+    ), [key, key, repr(float(value)) if isinstance(value, float) else str(int(value))]
 
 
 def _row_to_item(
