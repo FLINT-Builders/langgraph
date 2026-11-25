@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import json
 import logging
+import math
 import re
 import threading
 from collections import defaultdict
@@ -650,6 +651,8 @@ class BasePostgresStore(Generic[C]):
         """Helper to generate filter conditions."""
         if op == "$eq":
             return "value->%s = %s::jsonb", [key, json.dumps(value)]
+        elif op in _RANGE_SQL_OPERATORS and isinstance(value, (int, float)):
+            return _numeric_range_condition(key, op, value)
         elif op == "$gt":
             return "value->>%s > %s", [key, str(value)]
         elif op == "$gte":
@@ -1278,6 +1281,47 @@ def _get_index_params(store: Any) -> tuple[str, dict[str, Any]]:
 def _namespace_to_text(namespace: tuple[str, ...]) -> str:
     """Convert namespace tuple to text string."""
     return ".".join(namespace)
+
+
+_RANGE_SQL_OPERATORS = {"$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<="}
+
+# Decimal strings short enough that `::numeric` cannot overflow. Postgres caps
+# regex repetition counts at 255.
+_NUMERIC_TEXT_PATTERN = (
+    r"^\s*[-+]?(\d{1,255}(\.\d{0,255})?|\.\d{1,255})([eE][-+]?\d{1,4})?\s*$"
+)
+
+
+def _numeric_range_condition(
+    key: str, op: str, bound: int | float
+) -> tuple[str, list[Any]]:
+    """Compare a JSON field to a numeric bound as `numeric`, not as text.
+
+    Text ordering puts `"10"` before `"9"`, so a range filter on the raw text
+    would let values past the bound through. `numeric` is exact for every JSON
+    number. Booleans order as 0 and 1 and decimal strings are parsed, matching
+    `InMemoryStore`; other values never match.
+    """
+    number = (
+        "(CASE jsonb_typeof(value->%s)"
+        " WHEN 'number' THEN (value->>%s)::numeric"
+        " WHEN 'boolean' THEN (value->>%s)::boolean::int::numeric"
+        " WHEN 'string' THEN CASE WHEN value->>%s ~ %s THEN (value->>%s)::numeric END"
+        " END)"
+    )
+    params: list[Any] = [key, key, key, key, _NUMERIC_TEXT_PATTERN, key]
+    if isinstance(bound, float):
+        if math.isnan(bound):
+            return "FALSE", []
+        if math.isinf(bound):
+            if (bound > 0) == (op in ("$lt", "$lte")):
+                return f"{number} IS NOT NULL", params
+            return "FALSE", []
+        # Stored floats are serialized with the same shortest round-trip text.
+        bound_text = repr(bound)
+    else:
+        bound_text = str(int(bound))
+    return f"{number} {_RANGE_SQL_OPERATORS[op]} %s::numeric", [*params, bound_text]
 
 
 def _escape_like_literal(text: str) -> str:
