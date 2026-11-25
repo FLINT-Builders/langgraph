@@ -1262,7 +1262,7 @@ WORKDIR /deps/outer-unit_tests/unit_tests"""
 def test_config_to_docker_gen_ui_python_uses_workdir_with_special_chars():
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = pathlib.Path(tmpdir)
-        project_dir = tmpdir_path / "proj;echo pwned"
+        project_dir = tmpdir_path / "proj;echo;pwned"
         project_dir.mkdir()
         config_path = project_dir / "langgraph.json"
         config_path.write_text("{}\n")
@@ -1281,16 +1281,16 @@ def test_config_to_docker_gen_ui_python_uses_workdir_with_special_chars():
             base_image="langchain/langgraph-api",
         )
 
-        assert "WORKDIR /deps/outer-proj;echo pwned/src" in docker
+        assert "WORKDIR /deps/outer-proj;echo;pwned/src" in docker
         assert "RUN npm i && tsx /api/langgraph_api/js/build.mts" in docker
-        assert "RUN cd /deps/outer-proj;echo pwned/src" not in docker
-        assert ">> '/deps/outer-proj;echo pwned/pyproject.toml'" in docker
+        assert "RUN cd /deps/outer-proj;echo;pwned/src" not in docker
+        assert ">> '/deps/outer-proj;echo;pwned/pyproject.toml'" in docker
 
 
 def test_config_to_docker_nodejs_uses_workdir_with_special_chars():
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = pathlib.Path(tmpdir)
-        project_dir = tmpdir_path / "proj;echo pwned"
+        project_dir = tmpdir_path / "proj;echo;pwned"
         project_dir.mkdir()
         config_path = project_dir / "langgraph.json"
         config_path.write_text("{}\n")
@@ -1308,9 +1308,9 @@ def test_config_to_docker_nodejs_uses_workdir_with_special_chars():
             base_image="langchain/langgraphjs-api",
         )
 
-        assert "WORKDIR /deps/proj;echo pwned" in docker
+        assert "WORKDIR /deps/proj;echo;pwned" in docker
         assert "RUN npm i" in docker
-        assert "RUN cd /deps/proj;echo pwned" not in docker
+        assert "RUN cd /deps/proj;echo;pwned" not in docker
 
 
 def test_config_to_docker_pip_installer():
@@ -1793,9 +1793,9 @@ def test_config_to_docker_uv_lock_uses_workdir_for_js_install_with_special_chars
         tmpdir_path = pathlib.Path(tmpdir)
         project_root, config_path = _write_uv_lock_workspace(
             tmpdir_path,
-            config_relative_dir="apps/agent;echo pwned",
+            config_relative_dir="apps/agent;echo;pwned",
         )
-        agent_dir = project_root / "apps" / "agent;echo pwned"
+        agent_dir = project_root / "apps" / "agent;echo;pwned"
         (agent_dir / "package.json").write_text('{"packageManager":"pnpm@9.0.0"}\n')
         (agent_dir / "pnpm-lock.yaml").write_text("lockfileVersion: 9.0\n")
         (agent_dir / "ui.tsx").write_text("export const ui = null;\n")
@@ -1804,22 +1804,22 @@ def test_config_to_docker_uv_lock_uses_workdir_for_js_install_with_special_chars
             {
                 "python_version": "3.11",
                 "graphs": {
-                    "agent": "../../apps/agent;echo pwned/src/agent/graph.py:graph",
+                    "agent": "../../apps/agent;echo;pwned/src/agent/graph.py:graph",
                 },
                 "source": {"kind": "uv", "root": "../..", "package": "agent"},
-                "ui": {"agent": "../../apps/agent;echo pwned/ui.tsx"},
+                "ui": {"agent": "../../apps/agent;echo;pwned/ui.tsx"},
             }
         )
         docker, _ = config_to_docker(
             config_path, config, base_image="langchain/langgraph-api:0.2.47"
         )
 
-        assert "WORKDIR /deps/workspace/apps/agent;echo pwned" in docker
+        assert "WORKDIR /deps/workspace/apps/agent;echo;pwned" in docker
         assert (
             "RUN pnpm i --frozen-lockfile && tsx /api/langgraph_api/js/build.mts"
             in docker
         )
-        assert "RUN cd /deps/workspace/apps/agent;echo pwned" not in docker
+        assert "RUN cd /deps/workspace/apps/agent;echo;pwned" not in docker
 
 
 def test_config_to_docker_uv_lock_supports_single_uv_project_root():

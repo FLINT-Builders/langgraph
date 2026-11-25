@@ -11,6 +11,11 @@ from typing import Literal, NamedTuple
 import click
 import httpx
 
+from langgraph_cli._dockerfile import (
+    dockerfile_env_json,
+    validate_build_context,
+    validate_dockerfile_path,
+)
 from langgraph_cli.schemas import Config, Distros
 from langgraph_cli.uv_lock import python_config_to_docker_uv_lock
 
@@ -824,6 +829,27 @@ def _assemble_local_deps(config_path: pathlib.Path, config: Config) -> LocalDeps
     return LocalDeps(pip_reqs, real_pkgs, faux_pkgs, working_dir, additional_contexts)
 
 
+def _validate_local_deps_dockerfile_paths(
+    config_path: pathlib.Path, local_deps: LocalDeps
+) -> None:
+    for reqpath, destpath in local_deps.pip_reqs:
+        if reqpath.parent not in local_deps.additional_contexts:
+            validate_dockerfile_path(
+                reqpath.relative_to(config_path.parent).as_posix(),
+                description="Local dependency path",
+            )
+        validate_dockerfile_path(destpath, description="Container path")
+    for fullpath, (relpath, destpath) in local_deps.faux_pkgs.items():
+        validate_dockerfile_path(fullpath.name, description="Local dependency name")
+        validate_dockerfile_path(relpath, description="Local dependency path")
+        validate_dockerfile_path(destpath, description="Container path")
+    for relpath, name in local_deps.real_pkgs.values():
+        validate_dockerfile_path(relpath, description="Local dependency path")
+        validate_dockerfile_path(name, description="Local dependency name")
+    if local_deps.working_dir:
+        validate_dockerfile_path(local_deps.working_dir, description="Container path")
+
+
 def _update_graph_paths(
     config_path: pathlib.Path, config: Config, local_deps: LocalDeps
 ) -> None:
@@ -1122,7 +1148,11 @@ def _build_python_install_commands(
         )
 
     pip_config_file_str = (
-        f"ADD {config['pip_config_file']} /pipconfig.txt"
+        "ADD "
+        + validate_dockerfile_path(
+            config["pip_config_file"], description="pip_config_file"
+        )
+        + " /pipconfig.txt"
         if config.get("pip_config_file")
         else ""
     )
@@ -1133,32 +1163,36 @@ def _build_runtime_env_vars(config: Config) -> list[str]:
     env_vars = []
 
     if (store_config := config.get("store")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_STORE='{json.dumps(store_config)}'")
+        env_vars.append(f"ENV LANGGRAPH_STORE='{dockerfile_env_json(store_config)}'")
 
     if (auth_config := config.get("auth")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_AUTH='{json.dumps(auth_config)}'")
+        env_vars.append(f"ENV LANGGRAPH_AUTH='{dockerfile_env_json(auth_config)}'")
 
     if (encryption_config := config.get("encryption")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_ENCRYPTION='{json.dumps(encryption_config)}'")
+        env_vars.append(
+            f"ENV LANGGRAPH_ENCRYPTION='{dockerfile_env_json(encryption_config)}'"
+        )
 
     if (http_config := config.get("http")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_HTTP='{json.dumps(http_config)}'")
+        env_vars.append(f"ENV LANGGRAPH_HTTP='{dockerfile_env_json(http_config)}'")
 
     if (webhooks_config := config.get("webhooks")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_WEBHOOKS='{json.dumps(webhooks_config)}'")
+        env_vars.append(
+            f"ENV LANGGRAPH_WEBHOOKS='{dockerfile_env_json(webhooks_config)}'"
+        )
 
     if (checkpointer_config := config.get("checkpointer")) is not None:
         env_vars.append(
-            f"ENV LANGGRAPH_CHECKPOINTER='{json.dumps(checkpointer_config)}'"
+            f"ENV LANGGRAPH_CHECKPOINTER='{dockerfile_env_json(checkpointer_config)}'"
         )
 
     if (ui := config.get("ui")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_UI='{json.dumps(ui)}'")
+        env_vars.append(f"ENV LANGGRAPH_UI='{dockerfile_env_json(ui)}'")
 
     if (ui_config := config.get("ui_config")) is not None:
-        env_vars.append(f"ENV LANGGRAPH_UI_CONFIG='{json.dumps(ui_config)}'")
+        env_vars.append(f"ENV LANGGRAPH_UI_CONFIG='{dockerfile_env_json(ui_config)}'")
 
-    env_vars.append(f"ENV LANGSERVE_GRAPHS='{json.dumps(config['graphs'])}'")
+    env_vars.append(f"ENV LANGSERVE_GRAPHS='{dockerfile_env_json(config['graphs'])}'")
     return env_vars
 
 
@@ -1301,6 +1335,7 @@ def python_config_to_docker(
     # collect dependencies
     pypi_deps = [dep for dep in config["dependencies"] if not dep.startswith(".")]
     local_deps = _assemble_local_deps(config_path, config)
+    _validate_local_deps_dockerfile_paths(config_path.resolve(), local_deps)
     # Rewrite graph paths, so they point to the correct location in the Docker container
     _update_graph_paths(config_path, config, local_deps)
     # Rewrite auth path, so it points to the correct location in the Docker container
@@ -1320,7 +1355,7 @@ def python_config_to_docker(
             (
                 f"COPY --from=outer-{reqpath.name} requirements.txt {destpath}"
                 if reqpath.parent in local_deps.additional_contexts
-                else f"ADD {reqpath.relative_to(config_path.parent)} {destpath}"
+                else f"ADD {reqpath.relative_to(config_path.parent).as_posix()} {destpath}"
             )
             for reqpath, destpath in local_deps.pip_reqs
         )
@@ -1385,6 +1420,7 @@ ADD {relpath} /deps/{name}
             name = f"{preferred_name}_{suffix}"
             suffix += 1
 
+        validate_build_context(name, str(path))
         used_context_names.add(name)
         additional_context_names[path] = name
         additional_contexts[name] = str(path)
@@ -1503,6 +1539,7 @@ def node_config_to_docker(
     else:
         # Backward compatibility: use the original behavior
         faux_path = f"/deps/{config_path.parent.name}"
+    validate_dockerfile_path(faux_path, description="Container path")
 
     image_str = docker_tag(config, base_image, api_version)
 
@@ -1607,7 +1644,7 @@ def _calculate_relative_workdir(config_path: pathlib.Path, build_context: str) -
 
     try:
         relative_path = config_dir.relative_to(build_context_path)
-        return str(relative_path) if str(relative_path) != "." else ""
+        return relative_path.as_posix() if str(relative_path) != "." else ""
     except ValueError as _:
         raise ValueError(
             f"Configuration file {config_path} is not under the build context {build_context}. "
