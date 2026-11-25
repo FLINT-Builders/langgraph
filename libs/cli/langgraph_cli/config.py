@@ -500,6 +500,15 @@ def validate_config(config: Config) -> Config:
             errors.append(f"`source.root` must be a string, got {type(root).__name__}.")
         elif not root.strip():
             errors.append('`source.root` must be a non-empty string. Use `"."`.')
+        elif (
+            os.path.isabs(root)
+            or pathlib.PurePath(root).anchor
+            or pathlib.PureWindowsPath(root).anchor
+        ):
+            errors.append(
+                "`source.root` must be a path relative to the directory "
+                f'containing langgraph.json, such as "." or "..", got {root!r}.'
+            )
         package_name = source.get("package") if source else None
         if package_name is not None and (
             not isinstance(package_name, str) or not package_name.strip()

@@ -59,6 +59,7 @@ class UvLockPlan:
     install_order: tuple[UvLockPackage, ...]
     container_roots: dict[pathlib.Path, pathlib.PurePosixPath]
     working_dir: str
+    config_root: pathlib.Path
     all_workspace_roots: frozenset[pathlib.Path] = frozenset()
 
 
@@ -620,13 +621,44 @@ def _infer_uv_lock_target_package(
     )
 
 
+def _resolve_uv_source_root(config_root: pathlib.Path, root: str) -> pathlib.Path:
+    """Resolve `source.root` once and require it to stay in the config tree.
+
+    `config_root` must already be resolved. The returned path is the only one
+    callers may use: resolving `source.root` again could follow a symlink that
+    was retargeted after this check.
+    """
+    if (
+        os.path.isabs(root)
+        or pathlib.PurePath(root).anchor
+        or pathlib.PureWindowsPath(root).anchor
+    ):
+        raise click.UsageError(
+            f"source.root={root!r} must be a path relative to the directory "
+            f'containing langgraph.json, such as "." or "..".'
+        )
+    project_root = (config_root / root).resolve()
+    if not (
+        project_root == config_root
+        or config_root in project_root.parents
+        or project_root in config_root.parents
+    ):
+        raise click.UsageError(
+            f"source.root={root!r} resolves to {project_root}, which is "
+            f"neither inside nor a parent of {config_root}, the directory "
+            "containing langgraph.json. Point source.root at the uv project "
+            "or workspace root that contains langgraph.json."
+        )
+    return project_root
+
+
 def _plan_uv_lock_workspace(config_path: pathlib.Path, config: Config) -> UvLockPlan:
     config_root = config_path.parent.resolve()
     source = config["source"]
     root = source.get("root", ".")
     if not isinstance(root, str) or not root.strip():
         raise click.UsageError('`source.root` must be a non-empty string. Use `"."`.')
-    project_root = (config_root / root).resolve()
+    project_root = _resolve_uv_source_root(config_root, root)
     pyproject_path = project_root / "pyproject.toml"
     uv_lock_path = project_root / "uv.lock"
 
@@ -717,6 +749,7 @@ def _plan_uv_lock_workspace(config_path: pathlib.Path, config: Config) -> UvLock
             working_dir=str(
                 _container_root_for_uv_lock_package(project_root, target.root)
             ),
+            config_root=config_root,
             all_workspace_roots=all_workspace_roots,
         ),
     )
@@ -732,6 +765,7 @@ def _plan_uv_lock_workspace(config_path: pathlib.Path, config: Config) -> UvLock
         install_order=tuple(install_order),
         container_roots=container_roots,
         working_dir=str(working_dir),
+        config_root=config_root,
         all_workspace_roots=all_workspace_roots,
     )
 
@@ -889,12 +923,12 @@ def python_config_to_docker_uv_lock(
             "(langchain/langgraph-api >= 0.2.47)"
         )
 
-    config_root = config_path.parent.resolve()
     install_cmd = "uv pip install --system"
     _, global_reqs_pip_install, pip_config_file_str = _build_python_install_commands(
         config, install_cmd
     )
     plan = _plan_uv_lock_workspace(config_path, config)
+    config_root = plan.config_root
 
     _update_uv_lock_graph_paths(config_path, config, plan)
     for section, key in [
