@@ -11,6 +11,7 @@ from typing import Literal, NamedTuple
 import click
 import httpx
 
+from langgraph_cli._workspace import ensure_within_workspace, resolve_workspace_root
 from langgraph_cli.schemas import Config, Distros
 from langgraph_cli.uv_lock import python_config_to_docker_uv_lock
 
@@ -693,8 +694,10 @@ class LocalDeps(NamedTuple):
             container (e.g., `/deps/<name>` or similar). Otherwise, it may be `None`.
 
         additional_contexts: A list of paths to directories that contain local
-            dependencies in parent directories. These directories are added to the
-            Docker build context to ensure that the Dockerfile can access them.
+            dependencies outside the config file's directory. These directories
+            are added to the Docker build context to ensure that the Dockerfile
+            can access them. They are only allowed beneath an explicit workspace
+            root passed by the caller.
     """
 
     pip_reqs: list[tuple[pathlib.Path, str]]
@@ -706,8 +709,14 @@ class LocalDeps(NamedTuple):
     additional_contexts: list[pathlib.Path] = None
 
 
-def _assemble_local_deps(config_path: pathlib.Path, config: Config) -> LocalDeps:
+def _assemble_local_deps(
+    config_path: pathlib.Path,
+    config: Config,
+    *,
+    workspace_root: str | os.PathLike[str] | None = None,
+) -> LocalDeps:
     config_path = config_path.resolve()
+    boundary = resolve_workspace_root(config_path.parent, workspace_root)
     # ensure reserved package names are not used
     reserved = {
         "src",
@@ -748,6 +757,12 @@ def _assemble_local_deps(config_path: pathlib.Path, config: Config) -> LocalDeps
         # Verify that the local dependency can be resolved
         # (e.g., this would raise an informative error if a user mistyped a path).
         resolved = (config_path.parent / local_dep).resolve()
+        ensure_within_workspace(
+            resolved,
+            project_dir=config_path.parent,
+            workspace_root=boundary,
+            label=f"Local dependency '{local_dep}'",
+        )
 
         # validate local dependency
         if not resolved.exists():
@@ -1267,6 +1282,7 @@ def python_config_to_docker(
     api_version: str | None = None,
     *,
     escape_variables: bool = False,
+    workspace_root: str | os.PathLike[str] | None = None,
 ) -> tuple[str, dict[str, str]]:
     """Generate a Dockerfile from the configuration."""
     source_kind = _get_source_kind(config)
@@ -1279,6 +1295,7 @@ def python_config_to_docker(
             base_image,
             api_version=api_version,
             build_tools_to_uninstall=build_tools_to_uninstall,
+            workspace_root=workspace_root,
         )
     if pip_installer == "auto":
         if _image_supports_uv(base_image):
@@ -1300,7 +1317,9 @@ def python_config_to_docker(
 
     # collect dependencies
     pypi_deps = [dep for dep in config["dependencies"] if not dep.startswith(".")]
-    local_deps = _assemble_local_deps(config_path, config)
+    local_deps = _assemble_local_deps(
+        config_path, config, workspace_root=workspace_root
+    )
     # Rewrite graph paths, so they point to the correct location in the Docker container
     _update_graph_paths(config_path, config, local_deps)
     # Rewrite auth path, so it points to the correct location in the Docker container
@@ -1625,7 +1644,13 @@ def config_to_docker(
     build_command: str | None = None,
     build_context: str | None = None,
     escape_variables: bool = False,
+    workspace_root: str | os.PathLike[str] | None = None,
 ) -> tuple[str, dict[str, str]]:
+    """Generate a Dockerfile and the extra build contexts it needs.
+
+    Local directories named in the config must resolve inside the config file's
+    directory, or inside `workspace_root` when the caller passes one.
+    """
     base_image = base_image or default_base_image(config)
 
     if config.get("node_version") and not config.get("python_version"):
@@ -1645,6 +1670,7 @@ def config_to_docker(
         base_image=base_image,
         api_version=api_version,
         escape_variables=escape_variables,
+        workspace_root=workspace_root,
     )
 
 
@@ -1656,6 +1682,7 @@ def config_to_compose(
     image: str | None = None,
     watch: bool = False,
     engine_runtime_mode: str = "combined_queue_worker",
+    workspace_root: str | os.PathLike[str] | None = None,
 ) -> str:
     base_image = base_image or default_base_image(config)
 
@@ -1700,6 +1727,7 @@ def config_to_compose(
             base_image=base_image,
             api_version=api_version,
             escape_variables=True,
+            workspace_root=workspace_root,
         )
 
         additional_contexts_str = "\n".join(
@@ -1732,6 +1760,7 @@ def config_to_compose(
                 base_image=executor_base_image,
                 api_version=api_version,
                 escape_variables=True,
+                workspace_root=workspace_root,
             )
 
             executor_additional_contexts_str = "\n".join(

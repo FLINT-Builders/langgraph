@@ -64,6 +64,7 @@ langgraph up [OPTIONS]
   --verbose               Show detailed logs
   -c, --config FILE       Config file path
   -d, --docker-compose    Additional services file
+  --workspace-root DIR    Monorepo root that local dependencies may reach
 ```
 
 ### `langgraph build`
@@ -75,6 +76,7 @@ langgraph build -t IMAGE_TAG [OPTIONS]
   --platform TEXT          Target platforms (e.g., linux/amd64,linux/arm64)
   --pull / --no-pull      Use latest/local base image
   -c, --config FILE       Config file path
+  --workspace-root DIR    Monorepo root that local dependencies may reach
 ```
 
 ### `langgraph dockerfile`
@@ -84,7 +86,23 @@ Generate a Dockerfile for custom deployments.
 ```bash
 langgraph dockerfile SAVE_PATH [OPTIONS]
   -c, --config FILE       Config file path
+  --workspace-root DIR    Monorepo root that local dependencies may reach
 ```
+
+### Monorepos
+
+Local dependencies (entries in `dependencies` that start with `.`) and
+`source.root` must resolve inside the directory that contains `langgraph.json`.
+To use a package elsewhere in a monorepo, such as `"../../libs/shared"`, pass the
+repository root on the command line:
+
+```bash
+cd apps/agent
+langgraph build -t my-image --workspace-root ../..
+```
+
+`langgraph up`, `langgraph dockerfile`, and `langgraph deploy` accept the same
+flag. `langgraph.json` cannot widen this boundary itself.
 
 ## Configuration
 

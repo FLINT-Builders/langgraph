@@ -947,6 +947,7 @@ def _run_local_build(
     docker_build_args: Sequence[str],
     secrets: list[dict[str, str]],
     tracked_packages: list[str] | None,
+    workspace_root: pathlib.Path | None = None,
 ) -> BuildResult:
     """Build locally with Docker, push to registry, update deployment."""
     # Use buildx to cross-compile for amd64 when running on a non-x86_64 host
@@ -987,6 +988,7 @@ def _run_local_build(
                         docker_command=("docker", "buildx", "build"),
                         extra_flags=build_flags,
                         verbose=verbose,
+                        workspace_root=workspace_root,
                     )
             else:
                 with Progress(message="Building...", elapsed=not verbose):
@@ -1003,6 +1005,7 @@ def _run_local_build(
                         install_command,
                         build_command,
                         verbose=verbose,
+                        workspace_root=workspace_root,
                     )
         step += 1
 
@@ -1138,13 +1141,18 @@ def _run_remote_build(
     build_command: str | None,
     secrets: list[dict[str, str]],
     tracked_packages: list[str] | None,
+    workspace_root: pathlib.Path | None = None,
 ) -> BuildResult:
     """Upload source tarball and trigger a remote build."""
     from langgraph_cli.archive import create_archive
 
     em = _get_emitter()
     _log_deploy_step(step, "Creating source archive")
-    with create_archive(config, config_json) as (archive_path, file_size, config_rel):
+    with create_archive(config, config_json, workspace_root=workspace_root) as (
+        archive_path,
+        file_size,
+        config_rel,
+    ):
         em.info(f"Archive created ({file_size / _BYTES_PER_MIB:.1f} MB)")
         step += 1
 
@@ -1498,6 +1506,22 @@ def _deploy_base_options(
             click.option("--build-command", hidden=True),
             click.option("--api-version", type=str, hidden=True),
             click.option(
+                "--workspace-root",
+                default=None,
+                type=click.Path(
+                    exists=True,
+                    file_okay=False,
+                    dir_okay=True,
+                    resolve_path=True,
+                    path_type=pathlib.Path,
+                ),
+                help=(
+                    "Monorepo or uv workspace root that local paths in the "
+                    "config may reach. By default they must stay inside the "
+                    "directory that contains langgraph.json."
+                ),
+            ),
+            click.option(
                 "--remote/--no-remote",
                 "remote_build_flag",
                 default=None,
@@ -1589,6 +1613,7 @@ def _deploy_cmd(
     docker_build_args: Sequence[str],
     json_output: bool,
     no_input: bool,
+    workspace_root: pathlib.Path | None = None,
 ):
     global _emitter, _no_input
     _emitter = _Emitter(json_mode=json_output)
@@ -1698,6 +1723,7 @@ def _deploy_cmd(
             build_command=build_command,
             secrets=secrets,
             tracked_packages=tracked_packages,
+            workspace_root=workspace_root,
         )
     else:
         build_result = _run_local_build(
@@ -1719,6 +1745,7 @@ def _deploy_cmd(
             docker_build_args=docker_build_args,
             secrets=secrets,
             tracked_packages=tracked_packages,
+            workspace_root=workspace_root,
         )
 
     # -- 4. Shared wait + result --

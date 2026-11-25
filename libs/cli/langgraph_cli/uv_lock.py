@@ -17,6 +17,7 @@ from langgraph_cli._ignore import (
     _build_ignore_spec,
     _is_always_excluded,
 )
+from langgraph_cli._workspace import ensure_within_workspace, resolve_workspace_root
 from langgraph_cli.schemas import Config
 
 
@@ -620,13 +621,25 @@ def _infer_uv_lock_target_package(
     )
 
 
-def _plan_uv_lock_workspace(config_path: pathlib.Path, config: Config) -> UvLockPlan:
+def _plan_uv_lock_workspace(
+    config_path: pathlib.Path,
+    config: Config,
+    *,
+    workspace_root: str | os.PathLike[str] | None = None,
+) -> UvLockPlan:
     config_root = config_path.parent.resolve()
+    boundary = resolve_workspace_root(config_root, workspace_root)
     source = config["source"]
     root = source.get("root", ".")
     if not isinstance(root, str) or not root.strip():
         raise click.UsageError('`source.root` must be a non-empty string. Use `"."`.')
     project_root = (config_root / root).resolve()
+    ensure_within_workspace(
+        project_root,
+        project_dir=config_root,
+        workspace_root=boundary,
+        label=f"source.root {root!r}",
+    )
     pyproject_path = project_root / "pyproject.toml"
     uv_lock_path = project_root / "uv.lock"
 
@@ -872,6 +885,7 @@ def python_config_to_docker_uv_lock(
     api_version: str | None = None,
     *,
     build_tools_to_uninstall: tuple[str, ...] | None,
+    workspace_root: str | os.PathLike[str] | None = None,
 ) -> tuple[str, dict[str, str]]:
     from langgraph_cli.config import (
         DEFAULT_NODE_VERSION,
@@ -894,7 +908,7 @@ def python_config_to_docker_uv_lock(
     _, global_reqs_pip_install, pip_config_file_str = _build_python_install_commands(
         config, install_cmd
     )
-    plan = _plan_uv_lock_workspace(config_path, config)
+    plan = _plan_uv_lock_workspace(config_path, config, workspace_root=workspace_root)
 
     _update_uv_lock_graph_paths(config_path, config, plan)
     for section, key in [

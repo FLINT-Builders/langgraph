@@ -176,6 +176,30 @@ OPT_ENGINE_RUNTIME_MODE = click.option(
     help="Runtime mode. 'distributed' uses separate executor and orchestrator containers.",
 )
 
+OPT_WORKSPACE_ROOT = click.option(
+    "--workspace-root",
+    default=None,
+    type=click.Path(
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+        path_type=pathlib.Path,
+    ),
+    help="""Monorepo or uv workspace root that local paths in the config may reach.
+
+    \b
+    By default, local dependencies and `source.root` must stay inside the
+    directory that contains langgraph.json. Pass the repository root to allow
+    dependencies elsewhere in that repository, e.g. "../../libs/shared".
+
+    \b
+    Example:
+        langgraph build -t my-image --workspace-root ../..
+    \b
+    """,
+)
+
 
 # ---------------------------------------------------------------------------
 # Top-level CLI group
@@ -254,6 +278,7 @@ cli.add_command(deploy)
 @OPT_POSTGRES_URI
 @OPT_API_VERSION
 @OPT_ENGINE_RUNTIME_MODE
+@OPT_WORKSPACE_ROOT
 @click.option(
     "--image",
     type=str,
@@ -291,6 +316,7 @@ def up(
     engine_runtime_mode: str,
     image: str | None,
     base_image: str | None,
+    workspace_root: pathlib.Path | None,
 ):
     click.secho("Starting LangGraph API server...", fg="green")
     click.secho(
@@ -315,6 +341,7 @@ For production use, requires a license key in env var LANGGRAPH_CLOUD_LICENSE_KE
             engine_runtime_mode=engine_runtime_mode,
             image=image,
             base_image=base_image,
+            workspace_root=workspace_root,
         )
         # add up + options
         args.extend(["up", "--remove-orphans"])
@@ -400,6 +427,7 @@ For production use, requires a license key in env var LANGGRAPH_CLOUD_LICENSE_KE
 )
 @OPT_API_VERSION
 @OPT_ENGINE_RUNTIME_MODE
+@OPT_WORKSPACE_ROOT
 @click.option(
     "--install-command",
     help="Custom install command to run from the build context root. If not provided, auto-detects based on package manager files.",
@@ -426,6 +454,7 @@ def build(
     tag: str,
     install_command: str | None,
     build_command: str | None,
+    workspace_root: pathlib.Path | None,
 ):
     if install_command and langgraph_cli.config.has_disallowed_build_command_content(
         install_command
@@ -461,6 +490,7 @@ def build(
             docker_build_args,
             install_command,
             build_command,
+            workspace_root=workspace_root,
         )
 
 
@@ -546,6 +576,7 @@ tests
 )
 @OPT_API_VERSION
 @OPT_ENGINE_RUNTIME_MODE
+@OPT_WORKSPACE_ROOT
 @log_command
 def dockerfile(
     save_path: str,
@@ -554,6 +585,7 @@ def dockerfile(
     base_image: str | None = None,
     api_version: str | None = None,
     engine_runtime_mode: str = "combined_queue_worker",
+    workspace_root: pathlib.Path | None = None,
 ) -> None:
     from click import secho
 
@@ -575,6 +607,7 @@ def dockerfile(
         config=config_json,
         base_image=effective_base_image,
         api_version=api_version,
+        workspace_root=workspace_root,
     )
     with open(str(save_path), "w", encoding="utf-8") as f:
         f.write(dockerfile_content)
@@ -944,6 +977,7 @@ def prepare_args_and_stdin(
     image: str | None = None,
     # Like "langchain/langgraphjs-api" or "langchain/langgraph-api
     base_image: str | None = None,
+    workspace_root: pathlib.Path | None = None,
 ) -> tuple[list[str], str]:
     assert config_path.exists(), f"Config file not found: {config_path}"
     # prepare args
@@ -975,6 +1009,7 @@ def prepare_args_and_stdin(
         api_version=api_version,
         image=image,
         engine_runtime_mode=engine_runtime_mode,
+        workspace_root=workspace_root,
     )
     return args, stdin
 
@@ -996,6 +1031,7 @@ def prepare(
     engine_runtime_mode: str = "combined_queue_worker",
     image: str | None = None,
     base_image: str | None = None,
+    workspace_root: pathlib.Path | None = None,
 ) -> tuple[list[str], str]:
     """Prepare the arguments and stdin for running the LangGraph API server."""
     config_json = langgraph_cli.config.validate_config_file(config_path)
@@ -1039,5 +1075,6 @@ def prepare(
         engine_runtime_mode=engine_runtime_mode,
         image=image,
         base_image=base_image,
+        workspace_root=workspace_root,
     )
     return args, stdin

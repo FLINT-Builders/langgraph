@@ -89,7 +89,7 @@ jobs:
         if: ${{ (steps.changed-files.outputs.all || github.event_name == 'workflow_dispatch') &&matrix.example.name == 'A' }}
         working-directory: libs/cli/python-monorepo-example
         run: |
-          langgraph build -t langgraph-test-g -c apps/agent/langgraph.json
+          langgraph build -t langgraph-test-g -c apps/agent/langgraph.json --workspace-root .
       - name: Test Python monorepo service
         if: ${{ (steps.changed-files.outputs.all || github.event_name == 'workflow_dispatch') &&matrix.example.name == 'A' && env.HAS_LANGSMITH_API_KEY == 'true' }}
         working-directory: libs/cli/python-monorepo-example
@@ -156,7 +156,7 @@ jobs:
         if: ${{ (steps.changed-files.outputs.all || github.event_name == 'workflow_dispatch') &&matrix.example.name == 'A' }}
         working-directory: libs/cli/uv-examples/monorepo/apps/agent
         run: |
-          langgraph build -t langgraph-test-uv-monorepo
+          langgraph build -t langgraph-test-uv-monorepo --workspace-root ../..
       - name: Test uv monorepo service
         if: ${{ (steps.changed-files.outputs.all || github.event_name == 'workflow_dispatch') &&matrix.example.name == 'A' && env.HAS_LANGSMITH_API_KEY == 'true' }}
         working-directory: libs/cli/uv-examples/monorepo/apps/agent

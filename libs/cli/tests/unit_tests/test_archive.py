@@ -298,3 +298,50 @@ class TestCreateArchive:
             assert "myproject/app.py" in names
             assert "shared/lib.py" in names
             assert config_rel == "myproject/langgraph.json"
+
+    def _make_monorepo(self, tmp_path):
+        repo = tmp_path / "repo"
+        project = repo / "apps" / "agent"
+        project.mkdir(parents=True)
+        config_file = project / "langgraph.json"
+        config_file.write_text("{}")
+        (project / "app.py").write_text("print('hello')")
+        shared = repo / "libs" / "shared"
+        shared.mkdir(parents=True)
+        (shared / "lib.py").write_text("y = 2")
+        (tmp_path / "secret.txt").write_text("outside the repo")
+        return repo, config_file
+
+    def test_includes_sibling_dependency_inside_workspace_root(self, tmp_path):
+        repo, config_file = self._make_monorepo(tmp_path)
+        config = {"dependencies": [".", "../../libs/shared"]}
+
+        with create_archive(config_file, config, workspace_root=repo) as (
+            archive_path,
+            _size,
+            config_rel,
+        ):
+            with tarfile.open(archive_path, "r:gz") as tar:
+                names = tar.getnames()
+        assert "apps/agent/app.py" in names
+        assert "libs/shared/lib.py" in names
+        assert config_rel == "apps/agent/langgraph.json"
+
+    @pytest.mark.parametrize(
+        ("dependency", "use_workspace_root"),
+        [
+            ("../../libs/shared", False),
+            ("../../..", False),
+            ("../../..", True),
+        ],
+    )
+    def test_refuses_dependency_outside_boundary(
+        self, tmp_path, dependency, use_workspace_root
+    ):
+        repo, config_file = self._make_monorepo(tmp_path)
+        config = {"dependencies": [".", dependency]}
+        root = repo if use_workspace_root else None
+
+        with pytest.raises(click.UsageError, match="outside the"):
+            with create_archive(config_file, config, workspace_root=root):
+                pass

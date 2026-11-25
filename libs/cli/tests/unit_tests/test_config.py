@@ -666,6 +666,7 @@ def test_config_to_docker_simple():
             }
         ),
         base_image="langchain/langgraph-api",
+        workspace_root=PATH_TO_CONFIG.parents[2],
     )
     expected_docker_stdin = f"""\
 # syntax=docker/dockerfile:1.4
@@ -729,6 +730,7 @@ def test_config_to_docker_outside_path():
         PATH_TO_CONFIG,
         validate_config({"dependencies": [".", ".."], "graphs": graphs}),
         base_image="langchain/langgraph-api",
+        workspace_root=PATH_TO_CONFIG.parents[1],
     )
     expected_docker_stdin = (
         """\
@@ -776,6 +778,64 @@ WORKDIR /deps/outer-unit_tests/unit_tests\
     assert additional_contexts == {
         "outer-tests": str(pathlib.Path(__file__).parent.parent.absolute()),
     }
+
+
+@pytest.mark.parametrize("dependency", ["..", "../../examples", "./../.."])
+def test_config_to_docker_rejects_dependency_outside_project_by_default(dependency):
+    config = validate_config(
+        {"dependencies": [".", dependency], "graphs": {"agent": "./agent.py:graph"}}
+    )
+    with pytest.raises(click.UsageError, match="--workspace-root"):
+        config_to_docker(PATH_TO_CONFIG, config, base_image="langchain/langgraph-api")
+
+
+def test_config_to_docker_rejects_dependency_outside_workspace_root():
+    config = validate_config(
+        {
+            "dependencies": [".", "../../examples"],
+            "graphs": {"agent": "./agent.py:graph"},
+        }
+    )
+    with pytest.raises(click.UsageError, match="outside the workspace root"):
+        config_to_docker(
+            PATH_TO_CONFIG,
+            config,
+            base_image="langchain/langgraph-api",
+            workspace_root=PATH_TO_CONFIG.parents[1],
+        )
+
+
+@pytest.mark.parametrize("workspace_root", ["/", "~", "../examples"])
+def test_config_to_docker_rejects_invalid_workspace_root(workspace_root):
+    root = pathlib.Path(workspace_root).expanduser()
+    if workspace_root == "../examples":
+        root = PATH_TO_CONFIG.parents[2] / "examples"
+    config = validate_config(
+        {"dependencies": ["."], "graphs": {"agent": "./agent.py:graph"}}
+    )
+    with pytest.raises(click.UsageError, match="--workspace-root"):
+        config_to_docker(
+            PATH_TO_CONFIG,
+            config,
+            base_image="langchain/langgraph-api",
+            workspace_root=root,
+        )
+
+
+def test_config_to_docker_rejects_symlinked_dependency_outside_project(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "pyproject.toml").write_text('[project]\nname = "outside"\n')
+    (project / "linked").symlink_to(outside, target_is_directory=True)
+    config_path = project / "langgraph.json"
+    config_path.write_text("{}")
+    config = validate_config(
+        {"dependencies": [".", "./linked"], "graphs": {"agent": "./agent.py:graph"}}
+    )
+    with pytest.raises(click.UsageError, match="outside the project directory"):
+        config_to_docker(config_path, config, base_image="langchain/langgraph-api")
 
 
 def test_config_to_docker_pipconfig():
@@ -1387,7 +1447,10 @@ def test_config_to_docker_uv_lock():
             }
         )
         docker, additional_contexts = config_to_docker(
-            config_path, config, base_image="langchain/langgraph-api:0.2.47"
+            config_path,
+            config,
+            base_image="langchain/langgraph-api:0.2.47",
+            workspace_root=config_path.parents[2],
         )
 
         assert "uv pip install --system" in docker
@@ -1462,6 +1525,22 @@ def test_config_to_docker_uv_lock():
         assert "rm /usr/bin/uv /usr/bin/uvx" in docker
 
 
+def test_config_to_docker_uv_lock_rejects_root_outside_project_by_default():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _, config_path = _write_uv_lock_workspace(pathlib.Path(tmpdir))
+        config = validate_config(
+            {
+                "python_version": "3.11",
+                "graphs": {"agent": "../../apps/agent/src/agent/graph.py:graph"},
+                "source": {"kind": "uv", "root": "../..", "package": "agent"},
+            }
+        )
+        with pytest.raises(click.UsageError, match="source.root '../..'"):
+            config_to_docker(
+                config_path, config, base_image="langchain/langgraph-api:0.2.47"
+            )
+
+
 def test_config_to_docker_uv_lock_honors_root_workspace_sources():
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = pathlib.Path(tmpdir)
@@ -1481,7 +1560,10 @@ def test_config_to_docker_uv_lock_honors_root_workspace_sources():
             }
         )
         docker, _ = config_to_docker(
-            config_path, config, base_image="langchain/langgraph-api:0.2.47"
+            config_path,
+            config,
+            base_image="langchain/langgraph-api:0.2.47",
+            workspace_root=config_path.parents[2],
         )
 
         assert (
@@ -1532,7 +1614,10 @@ def test_config_to_docker_uv_lock_ignores_unrelated_workspace_package_sources():
             }
         )
         docker, _ = config_to_docker(
-            config_path, config, base_image="langchain/langgraph-api:0.2.47"
+            config_path,
+            config,
+            base_image="langchain/langgraph-api:0.2.47",
+            workspace_root=config_path.parents[2],
         )
 
         assert (
@@ -1570,7 +1655,10 @@ def test_config_to_docker_uv_lock_ignores_unrelated_root_sources():
             }
         )
         docker, _ = config_to_docker(
-            config_path, config, base_image="langchain/langgraph-api:0.2.47"
+            config_path,
+            config,
+            base_image="langchain/langgraph-api:0.2.47",
+            workspace_root=config_path.parents[2],
         )
 
         assert (
@@ -1614,7 +1702,10 @@ def test_config_to_docker_uv_lock_validates_root_path_sources_relative_to_projec
         )
         with pytest.raises(click.UsageError, match="outside project_root"):
             config_to_docker(
-                config_path, config, base_image="langchain/langgraph-api:0.2.47"
+                config_path,
+                config,
+                base_image="langchain/langgraph-api:0.2.47",
+                workspace_root=config_path.parents[2],
             )
 
 
@@ -1638,7 +1729,10 @@ def test_config_to_docker_uv_lock_requires_explicit_workspace_sources():
             match="not inside the target package 'agent'",
         ):
             config_to_docker(
-                config_path, config, base_image="langchain/langgraph-api:0.2.47"
+                config_path,
+                config,
+                base_image="langchain/langgraph-api:0.2.47",
+                workspace_root=config_path.parents[2],
             )
 
 
@@ -1660,7 +1754,10 @@ def test_config_to_docker_uv_lock_accepts_path_workspace_sources():
             }
         )
         docker, _ = config_to_docker(
-            config_path, config, base_image="langchain/langgraph-api:0.2.47"
+            config_path,
+            config,
+            base_image="langchain/langgraph-api:0.2.47",
+            workspace_root=config_path.parents[2],
         )
 
         assert (
@@ -1689,7 +1786,10 @@ def test_config_to_docker_uv_lock_rejects_package_false_workspace_dependency():
         )
         with pytest.raises(click.UsageError, match="tool.uv.package = false"):
             config_to_docker(
-                config_path, config, base_image="langchain/langgraph-api:0.2.47"
+                config_path,
+                config,
+                base_image="langchain/langgraph-api:0.2.47",
+                workspace_root=config_path.parents[2],
             )
 
 
@@ -1712,7 +1812,10 @@ def test_config_to_docker_uv_lock_accepts_root_path_workspace_sources():
             }
         )
         docker, _ = config_to_docker(
-            config_path, config, base_image="langchain/langgraph-api:0.2.47"
+            config_path,
+            config,
+            base_image="langchain/langgraph-api:0.2.47",
+            workspace_root=config_path.parents[2],
         )
 
         assert (
@@ -1747,7 +1850,10 @@ def test_config_to_docker_uv_lock_rejects_mismatched_path_workspace_sources():
             match="dependency name and the workspace package name must match",
         ):
             config_to_docker(
-                config_path, config, base_image="langchain/langgraph-api:0.2.47"
+                config_path,
+                config,
+                base_image="langchain/langgraph-api:0.2.47",
+                workspace_root=config_path.parents[2],
             )
 
 
@@ -1774,7 +1880,10 @@ def test_config_to_docker_uv_lock_detects_js_pm_from_target_package_root():
             }
         )
         docker, _ = config_to_docker(
-            config_path, config, base_image="langchain/langgraph-api:0.2.47"
+            config_path,
+            config,
+            base_image="langchain/langgraph-api:0.2.47",
+            workspace_root=config_path.parents[2],
         )
 
         assert "WORKDIR /deps/workspace/apps/agent" in docker
@@ -1811,7 +1920,10 @@ def test_config_to_docker_uv_lock_uses_workdir_for_js_install_with_special_chars
             }
         )
         docker, _ = config_to_docker(
-            config_path, config, base_image="langchain/langgraph-api:0.2.47"
+            config_path,
+            config,
+            base_image="langchain/langgraph-api:0.2.47",
+            workspace_root=config_path.parents[2],
         )
 
         assert "WORKDIR /deps/workspace/apps/agent;echo pwned" in docker
@@ -2021,7 +2133,10 @@ def test_config_to_docker_uv_lock_skips_dockerignore_entries_in_workspace():
             }
         )
         docker, _ = config_to_docker(
-            config_path, config, base_image="langchain/langgraph-api:0.2.47"
+            config_path,
+            config,
+            base_image="langchain/langgraph-api:0.2.47",
+            workspace_root=config_path.parents[2],
         )
 
         assert "COPY --from=uv-workspace-root src /deps/workspace/src" in docker
@@ -2223,7 +2338,10 @@ def test_config_to_docker_uv_lock_rejects_ignored_workspace_member():
             click.UsageError, match=r"Workspace member 'shared' at libs/shared"
         ):
             config_to_docker(
-                config_path, config, base_image="langchain/langgraph-api:0.2.47"
+                config_path,
+                config,
+                base_image="langchain/langgraph-api:0.2.47",
+                workspace_root=config_path.parents[2],
             )
 
 
@@ -2247,7 +2365,10 @@ def test_config_to_docker_uv_lock_rejects_invalid_source_package_type():
             click.UsageError, match="`source.package` must be a non-empty string"
         ):
             config_to_docker(
-                config_path, config, base_image="langchain/langgraph-api:0.2.47"
+                config_path,
+                config,
+                base_image="langchain/langgraph-api:0.2.47",
+                workspace_root=config_path.parents[2],
             )
 
 
@@ -2274,7 +2395,10 @@ def test_config_to_docker_uv_lock_rejects_paths_outside_target_closure():
             match="not inside the target package 'agent'",
         ):
             config_to_docker(
-                config_path, config, base_image="langchain/langgraph-api:0.2.47"
+                config_path,
+                config,
+                base_image="langchain/langgraph-api:0.2.47",
+                workspace_root=config_path.parents[2],
             )
 
 
@@ -2307,7 +2431,10 @@ def test_config_to_docker_uv_lock_rejects_unrelated_member_when_root_in_closure(
             match="not inside the target package 'agent'",
         ):
             config_to_docker(
-                config_path, config, base_image="langchain/langgraph-api:0.2.47"
+                config_path,
+                config,
+                base_image="langchain/langgraph-api:0.2.47",
+                workspace_root=config_path.parents[2],
             )
 
 
@@ -2335,7 +2462,10 @@ def test_config_to_docker_uv_lock_root_package_copy_skips_unrelated_members():
             }
         )
         docker, _ = config_to_docker(
-            config_path, config, base_image="langchain/langgraph-api:0.2.47"
+            config_path,
+            config,
+            base_image="langchain/langgraph-api:0.2.47",
+            workspace_root=config_path.parents[2],
         )
 
         assert "COPY --from=uv-workspace-root . /deps/workspace" not in docker
@@ -2370,7 +2500,10 @@ def test_config_to_docker_uv_lock_missing_lockfile():
         )
         with pytest.raises(click.UsageError, match="No uv.lock found"):
             config_to_docker(
-                config_path, config, base_image="langchain/langgraph-api:0.2.47"
+                config_path,
+                config,
+                base_image="langchain/langgraph-api:0.2.47",
+                workspace_root=config_path.parents[2],
             )
 
 
@@ -2389,7 +2522,10 @@ def test_config_to_docker_uv_lock_missing_pyproject():
         )
         with pytest.raises(click.UsageError, match="No pyproject.toml found"):
             config_to_docker(
-                config_path, config, base_image="langchain/langgraph-api:0.2.47"
+                config_path,
+                config,
+                base_image="langchain/langgraph-api:0.2.47",
+                workspace_root=config_path.parents[2],
             )
 
 

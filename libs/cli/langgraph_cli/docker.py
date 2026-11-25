@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 import pathlib
 import platform
 import shutil
@@ -345,26 +346,9 @@ def build_docker_image(
     docker_command: Sequence[str] | None = None,
     extra_flags: Sequence[str] = (),
     verbose: bool = True,
+    workspace_root: str | os.PathLike[str] | None = None,
 ):
     """Build a Docker image from a LangGraph config."""
-    # pull latest images
-    if pull:
-        runner.run(
-            subp_exec(
-                "docker",
-                "pull",
-                langgraph_cli.config.docker_tag(config_json, base_image, api_version),
-                verbose=verbose,
-            )
-        )
-    set("Building...")
-    # apply options
-    args = [
-        "-f",
-        "-",  # stdin
-        "-t",
-        tag,
-    ]
     # determine build context: use current directory for JS projects, config parent for Python
     is_js_project = config_json.get("node_version") and not config_json.get(
         "python_version"
@@ -376,9 +360,12 @@ def build_docker_image(
     else:
         build_context = str(config.parent)
 
+    pull_tag = langgraph_cli.config.docker_tag(config_json, base_image, api_version)
     # Deep copy to avoid mutating the caller's config (config_to_docker
     # rewrites graph paths to container-internal paths in place).
     config_json = copy.deepcopy(config_json)
+    # Generate the Dockerfile before running docker so a rejected local path
+    # stops the build before any docker command runs.
     stdin, additional_contexts = langgraph_cli.config.config_to_docker(
         config_path=config,
         config=config_json,
@@ -387,7 +374,26 @@ def build_docker_image(
         install_command=install_command,
         build_command=build_command,
         build_context=build_context,
+        workspace_root=workspace_root,
     )
+    # pull latest images
+    if pull:
+        runner.run(
+            subp_exec(
+                "docker",
+                "pull",
+                pull_tag,
+                verbose=verbose,
+            )
+        )
+    set("Building...")
+    # apply options
+    args = [
+        "-f",
+        "-",  # stdin
+        "-t",
+        tag,
+    ]
     # add additional_contexts
     if additional_contexts:
         for k, v in additional_contexts.items():
