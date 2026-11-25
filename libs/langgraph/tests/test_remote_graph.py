@@ -19,7 +19,7 @@ from typing_extensions import TypedDict
 from langgraph.errors import GraphInterrupt
 from langgraph.graph import END, START, MessagesState, StateGraph, add_messages
 from langgraph.pregel import Pregel
-from langgraph.pregel.remote import RemoteGraph
+from langgraph.pregel.remote import RemoteException, RemoteGraph
 from langgraph.types import Interrupt, StateSnapshot
 from tests.any_str import AnyStr
 from tests.conftest import NO_DOCKER
@@ -483,6 +483,23 @@ def test_stream():
         sync_client=mock_sync_client,
     )
 
+    # remote interrupts are not propagated to the caller unless opted in
+    with pytest.raises(RemoteException):
+        for stream_part in remote_pregel.stream(
+            {"input": "data"},
+            config={
+                "configurable": {"thread_id": "thread_1", "checkpoint_ns": "some_ns"}
+            },
+            stream_mode="values",
+        ):
+            pass
+
+    remote_pregel = RemoteGraph(
+        "test_graph_id",
+        sync_client=mock_sync_client,
+        propagate_interrupts=True,
+    )
+
     # test raising graph interrupt if invoked as a subgraph
     with pytest.raises(GraphInterrupt) as exc:
         for stream_part in remote_pregel.stream(
@@ -651,6 +668,23 @@ async def test_astream():
     remote_pregel = RemoteGraph(
         "test_graph_id",
         client=mock_async_client,
+    )
+
+    # remote interrupts are not propagated to the caller unless opted in
+    with pytest.raises(RemoteException):
+        async for stream_part in remote_pregel.astream(
+            {"input": "data"},
+            config={
+                "configurable": {"thread_id": "thread_1", "checkpoint_ns": "some_ns"}
+            },
+            stream_mode="values",
+        ):
+            pass
+
+    remote_pregel = RemoteGraph(
+        "test_graph_id",
+        client=mock_async_client,
+        propagate_interrupts=True,
     )
 
     # test raising graph interrupt if invoked as a subgraph

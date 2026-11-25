@@ -115,6 +115,44 @@ class RemoteException(Exception):
     pass
 
 
+def _parse_remote_interrupt(data: Any) -> Interrupt:
+    """Build an `Interrupt` from a remote payload using only known fields."""
+    if isinstance(data, Interrupt):
+        return Interrupt(
+            value=data.value, id=data.id, response_schema=data.response_schema
+        )
+    if not isinstance(data, dict):
+        raise RemoteException(f"Invalid interrupt payload from remote graph: {data!r}")
+    kwargs: dict[str, Any] = {"value": data.get("value")}
+    if "id" in data:
+        if not isinstance(data["id"], str):
+            raise RemoteException("Invalid interrupt id from remote graph")
+        kwargs["id"] = data["id"]
+    response_schema = data.get("response_schema")
+    if response_schema is not None:
+        if not isinstance(response_schema, dict):
+            raise RemoteException("Invalid interrupt response_schema from remote graph")
+        kwargs["response_schema"] = response_schema
+    return Interrupt(**kwargs)
+
+
+def _parse_remote_parent_command(data: dict[str, Any]) -> Command:
+    """Build a `Command.PARENT` from a remote payload using only known fields."""
+    goto = data.get("goto", ())
+    if isinstance(goto, str):
+        pass
+    elif isinstance(goto, (list, tuple)) and all(isinstance(g, str) for g in goto):
+        goto = tuple(goto)
+    else:
+        raise RemoteException("Invalid parent command goto from remote graph")
+    return Command(
+        graph=Command.PARENT,
+        update=data.get("update"),
+        resume=data.get("resume"),
+        goto=goto,
+    )
+
+
 class RemoteGraph(PregelProtocol):
     """The `RemoteGraph` class is a client implementation for calling remote
     APIs that implement the LangGraph Server API specification.
@@ -142,6 +180,8 @@ class RemoteGraph(PregelProtocol):
         config: RunnableConfig | None = None,
         name: str | None = None,
         distributed_tracing: bool = False,
+        allow_parent_commands: bool = False,
+        propagate_interrupts: bool = False,
     ):
         """Specify `url`, `api_key`, and/or `headers` to create default sync and async clients.
 
@@ -161,6 +201,16 @@ class RemoteGraph(PregelProtocol):
                 This is useful for adding `RemoteGraph` as a subgraph via `graph.add_node(remote_graph)`.
                 If not provided, defaults to the assistant ID.
             distributed_tracing: Whether to enable sending LangSmith distributed tracing headers.
+            allow_parent_commands: Whether a `Command(graph=Command.PARENT)` emitted by
+                the remote graph may be applied to the calling graph. Only enable this
+                for remote deployments you trust, since such a command can write any
+                channel of the parent state and route the parent to any node. When
+                disabled, a parent command from the remote graph raises
+                `RemoteException`.
+            propagate_interrupts: Whether interrupts raised by the remote graph pause
+                the calling graph when this `RemoteGraph` is used as a subgraph. Only
+                enable this for remote deployments you trust. When disabled, a remote
+                interrupt raises `RemoteException` in the calling graph.
         """
         self.assistant_id = assistant_id
         if name is None:
@@ -169,6 +219,8 @@ class RemoteGraph(PregelProtocol):
             self.name = name
         self.config = config
         self.distributed_tracing = distributed_tracing
+        self.allow_parent_commands = allow_parent_commands
+        self.propagate_interrupts = propagate_interrupts
 
         if client is None and url is not None:
             client = get_client(url=url, api_key=api_key, headers=headers)
@@ -323,7 +375,7 @@ class RemoteGraph(PregelProtocol):
         tasks: list[PregelTask] = []
         for task in state["tasks"]:
             interrupts = tuple(
-                Interrupt(**interrupt) for interrupt in task["interrupts"]
+                _parse_remote_interrupt(interrupt) for interrupt in task["interrupts"]
             )
 
             tasks.append(
@@ -826,8 +878,17 @@ class RemoteGraph(PregelProtocol):
             else:
                 mode, ns = chunk.event, ()
             # raise ParentCommand exception for command events
-            if mode == "command" and chunk.data.get("graph") == Command.PARENT:
-                raise ParentCommand(Command(**chunk.data))
+            if (
+                mode == "command"
+                and isinstance(chunk.data, dict)
+                and chunk.data.get("graph") == Command.PARENT
+            ):
+                if not self.allow_parent_commands:
+                    raise RemoteException(
+                        "Remote graph emitted a parent command, but "
+                        "`allow_parent_commands` is not enabled on this RemoteGraph."
+                    )
+                raise ParentCommand(_parse_remote_parent_command(chunk.data))
             # prepend caller ns (as it is not passed to remote graph)
             if caller_ns := (config or {}).get(CONF, {}).get(CONFIG_KEY_CHECKPOINT_NS):
                 caller_ns = tuple(caller_ns.split(NS_SEP))
@@ -839,8 +900,14 @@ class RemoteGraph(PregelProtocol):
             if chunk.event.startswith("updates"):
                 if isinstance(chunk.data, dict) and INTERRUPT in chunk.data:
                     if caller_ns:
+                        if not self.propagate_interrupts:
+                            raise RemoteException(
+                                "Remote graph was interrupted, but "
+                                "`propagate_interrupts` is not enabled on this "
+                                "RemoteGraph."
+                            )
                         raise GraphInterrupt(
-                            [Interrupt(**i) for i in chunk.data[INTERRUPT]]
+                            [_parse_remote_interrupt(i) for i in chunk.data[INTERRUPT]]
                         )
             elif chunk.event.startswith("error"):
                 raise RemoteException(chunk.data)
@@ -856,7 +923,7 @@ class RemoteGraph(PregelProtocol):
                 ints: tuple[Interrupt, ...] = ()
                 if mode == "values" and isinstance(chunk.data, dict):
                     ints = tuple(
-                        Interrupt(**i) if isinstance(i, dict) else i
+                        _parse_remote_interrupt(i)
                         for i in chunk.data.pop(INTERRUPT, ())
                     )
                 yield {"type": mode, "ns": ns, "data": chunk.data, "interrupts": ints}
@@ -981,8 +1048,17 @@ class RemoteGraph(PregelProtocol):
             else:
                 mode, ns = chunk.event, ()
             # raise ParentCommand exception for command events
-            if mode == "command" and chunk.data.get("graph") == Command.PARENT:
-                raise ParentCommand(Command(**chunk.data))
+            if (
+                mode == "command"
+                and isinstance(chunk.data, dict)
+                and chunk.data.get("graph") == Command.PARENT
+            ):
+                if not self.allow_parent_commands:
+                    raise RemoteException(
+                        "Remote graph emitted a parent command, but "
+                        "`allow_parent_commands` is not enabled on this RemoteGraph."
+                    )
+                raise ParentCommand(_parse_remote_parent_command(chunk.data))
             # prepend caller ns (as it is not passed to remote graph)
             if caller_ns := (config or {}).get(CONF, {}).get(CONFIG_KEY_CHECKPOINT_NS):
                 caller_ns = tuple(caller_ns.split(NS_SEP))
@@ -994,8 +1070,14 @@ class RemoteGraph(PregelProtocol):
             if chunk.event.startswith("updates"):
                 if isinstance(chunk.data, dict) and INTERRUPT in chunk.data:
                     if caller_ns:
+                        if not self.propagate_interrupts:
+                            raise RemoteException(
+                                "Remote graph was interrupted, but "
+                                "`propagate_interrupts` is not enabled on this "
+                                "RemoteGraph."
+                            )
                         raise GraphInterrupt(
-                            [Interrupt(**i) for i in chunk.data[INTERRUPT]]
+                            [_parse_remote_interrupt(i) for i in chunk.data[INTERRUPT]]
                         )
             elif chunk.event.startswith("error"):
                 raise RemoteException(chunk.data)
@@ -1011,7 +1093,7 @@ class RemoteGraph(PregelProtocol):
                 ints: tuple[Interrupt, ...] = ()
                 if mode == "values" and isinstance(chunk.data, dict):
                     ints = tuple(
-                        Interrupt(**i) if isinstance(i, dict) else i
+                        _parse_remote_interrupt(i)
                         for i in chunk.data.pop(INTERRUPT, ())
                     )
                 yield {"type": mode, "ns": ns, "data": chunk.data, "interrupts": ints}
