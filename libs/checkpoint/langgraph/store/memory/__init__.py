@@ -132,6 +132,16 @@ from langgraph.store.base import (
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_MAX_TEXTS_PER_PUT = 32
+
+
+def _validate_max_texts_per_put(value: Any) -> int:
+    if value is None:
+        return DEFAULT_MAX_TEXTS_PER_PUT
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"max_texts_per_put must be a positive integer. Got {value!r}")
+    return value
+
 
 class InMemoryStore(BaseStore):
     """In-memory dictionary-backed store with optional vector search.
@@ -191,6 +201,9 @@ class InMemoryStore(BaseStore):
         self.index_config = index
         if self.index_config:
             self.index_config = self.index_config.copy()
+            self.index_config["max_texts_per_put"] = _validate_max_texts_per_put(
+                self.index_config.get("max_texts_per_put")
+            )
             self.embeddings: Embeddings | None = ensure_embeddings(
                 self.index_config.get("embed"),
             )
@@ -420,6 +433,7 @@ class InMemoryStore(BaseStore):
     ) -> dict[str, list[tuple[tuple[str, ...], str, str]]]:
         if put_ops and self.index_config and self.embeddings:
             to_embed = defaultdict(list)
+            max_texts = self.index_config["max_texts_per_put"]
 
             for op in put_ops.values():
                 if op.value is not None and op.index is not False:
@@ -427,17 +441,31 @@ class InMemoryStore(BaseStore):
                         paths = self.index_config["__tokenized_fields"]
                     else:
                         paths = [(ix, tokenize_path(ix)) for ix in op.index]
+                    remaining = max_texts
                     for path, field in paths:
                         texts = get_text_at_path(op.value, field)
-                        if texts:
-                            if len(texts) > 1:
-                                for i, text in enumerate(texts):
-                                    to_embed[text].append(
-                                        (op.namespace, op.key, f"{path}.{i}")
-                                    )
-
-                            else:
-                                to_embed[texts[0]].append((op.namespace, op.key, path))
+                        if not texts:
+                            continue
+                        multiple = len(texts) > 1
+                        truncated = len(texts) > remaining
+                        if truncated:
+                            texts = texts[:remaining]
+                        remaining -= len(texts)
+                        for i, text in enumerate(texts):
+                            to_embed[text].append(
+                                (
+                                    op.namespace,
+                                    op.key,
+                                    f"{path}.{i}" if multiple else path,
+                                )
+                            )
+                        if truncated:
+                            logger.warning(
+                                "Embedding at most %d texts for a single put; "
+                                "remaining matches were not indexed.",
+                                max_texts,
+                            )
+                            break
 
             return to_embed
 
