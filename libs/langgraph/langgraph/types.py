@@ -532,7 +532,12 @@ class CachePolicy(Generic[KeyFuncT]):
 
     key_func: KeyFuncT = default_cache_key  # type: ignore[assignment]
     """Function to generate a cache key from the node's input.
-    Defaults to hashing the input with pickle."""
+    Defaults to hashing the input with pickle.
+
+    The final key is always also scoped to the caller: runtime context, server
+    info (including the authenticated user), store, `previous`, and
+    `configurable` values. Nodes that accept `config` or `runtime` are
+    additionally scoped to the thread and run ids."""
 
     ttl: int | None = None
     """Time to live for the cache entry in seconds. If `None`, the entry never expires."""

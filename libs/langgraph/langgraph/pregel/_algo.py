@@ -31,6 +31,12 @@ from langgraph.checkpoint.base import (
 from langgraph.store.base import BaseStore
 from xxhash import xxh3_128_hexdigest
 
+from langgraph._internal._cache import (
+    auth_user_scope,
+    cache_key_digest,
+    cache_scope_digest,
+    object_token,
+)
 from langgraph._internal._config import merge_configs, patch_config
 from langgraph._internal._constants import (
     CACHE_NS_WRITES,
@@ -62,6 +68,7 @@ from langgraph._internal._constants import (
     RETURN,
     TASKS,
 )
+from langgraph._internal._runnable import RunnableCallable, RunnableSeq
 from langgraph._internal._scratchpad import PregelScratchpad
 from langgraph._internal._typing import EMPTY_SEQ, MISSING
 from langgraph.channels.base import BaseChannel
@@ -74,6 +81,7 @@ from langgraph.pregel._call import get_runnable_for_task, identifier
 from langgraph.pregel._io import read_channels
 from langgraph.pregel._log import logger
 from langgraph.pregel._read import INPUT_CACHE_KEY_TYPE, PregelNode
+from langgraph.pregel._write import ChannelWrite
 from langgraph.runtime import DEFAULT_RUNTIME, ExecutionInfo, Runtime
 from langgraph.types import (
     All,
@@ -88,6 +96,89 @@ from langgraph.types import (
 
 GetNextVersion = Callable[[V | None, None], V]
 SUPPORTS_EXC_NOTES = sys.version_info >= (3, 11)
+
+_CACHE_SCOPE_EXECUTION_KEYS = frozenset(
+    (
+        CONFIG_KEY_THREAD_ID,
+        CONFIG_KEY_CHECKPOINT_ID,
+        CONFIG_KEY_CHECKPOINT_NS,
+        CONFIG_KEY_CHECKPOINT_MAP,
+        "run_id",
+    )
+)
+
+
+def _reads_execution_ids(runnable: Any) -> bool:
+    if isinstance(runnable, ChannelWrite):
+        return False
+    if isinstance(runnable, RunnableSeq):
+        return any(_reads_execution_ids(step) for step in runnable.steps)
+    if isinstance(runnable, RunnableCallable):
+        return "config" in runnable.func_accepts or "runtime" in runnable.func_accepts
+    return True
+
+
+def _task_cache_key(
+    cache_policy: CachePolicy,
+    ns: tuple[str, ...],
+    args_key: str | bytes,
+    *,
+    runnable: Any,
+    config: RunnableConfig,
+    runtime: Runtime,
+    extra: Sequence[tuple[str, Any]] = (),
+) -> CacheKey | None:
+    """Build the cache key for a task, scoped to the caller it runs for.
+
+    A cached node can read the runtime context, server info, store, `previous`
+    and config without declaring them (e.g. via `get_runtime()`), so these are
+    always part of the key, regardless of `cache_policy.key_func`. Per-execution
+    ids (thread, run, checkpoint) are only included for nodes that accept
+    `config` or `runtime`, so that channel-only nodes stay cached across threads.
+    Returns `None` (no caching) when the scope cannot be encoded safely.
+    """
+    configurable = config.get(CONF, {})
+    if not all(isinstance(k, str) for k in configurable):
+        return None
+    if runtime.store is None:
+        store_token: bytes | None = b""
+    else:
+        store_token = object_token(runtime.store)
+        if store_token is None:
+            return None
+    server_info = runtime.server_info
+    parts: list[tuple[str, Any]] = [
+        ("context", runtime.context),
+        ("store", store_token),
+        ("previous", runtime.previous),
+        (
+            "server_info",
+            None
+            if server_info is None
+            else (
+                server_info.assistant_id,
+                server_info.graph_id,
+                auth_user_scope(server_info.user),
+            ),
+        ),
+    ]
+    for key in sorted(configurable):
+        if key.startswith("__pregel_") or key in _CACHE_SCOPE_EXECUTION_KEYS:
+            continue
+        value = configurable[key]
+        if key == "langgraph_auth_user":
+            value = auth_user_scope(value)
+        parts.append((f"configurable:{key}", value))
+    if _reads_execution_ids(runnable):
+        parts.append(("thread_id", configurable.get(CONFIG_KEY_THREAD_ID)))
+        parts.append(("configurable_run_id", configurable.get("run_id")))
+        run_id = config.get("run_id")
+        parts.append(("run_id", None if run_id is None else str(run_id)))
+    parts.extend(extra)
+    scope = cache_scope_digest(parts)
+    if scope is None:
+        return None
+    return CacheKey(ns, cache_key_digest(scope, args_key), cache_policy.ttl)
 
 
 class WritesProtocol(Protocol):
@@ -665,26 +756,6 @@ def prepare_single_task(
                     if proc.metadata:
                         metadata.update(proc.metadata)
                     writes: deque[tuple[str, Any]] = deque()
-                    cache_policy = proc.cache_policy or cache_policy
-                    if cache_policy:
-                        args_key = cache_policy.key_func(val)
-                        cache_key = CacheKey(
-                            (
-                                CACHE_NS_WRITES,
-                                (identifier(proc) or "__dynamic__"),
-                                name,
-                            ),
-                            xxh3_128_hexdigest(
-                                (
-                                    args_key.encode()
-                                    if isinstance(args_key, str)
-                                    else args_key
-                                ),
-                            ),
-                            cache_policy.ttl,
-                        )
-                    else:
-                        cache_key = None
                     runtime = cast(
                         Runtime, configurable.get(CONFIG_KEY_RUNTIME, DEFAULT_RUNTIME)
                     )
@@ -699,6 +770,22 @@ def prepare_single_task(
                             run_id=str(rid) if (rid := config.get("run_id")) else None,
                         ),
                     )
+                    cache_policy = proc.cache_policy or cache_policy
+                    if cache_policy:
+                        cache_key = _task_cache_key(
+                            cache_policy,
+                            (
+                                CACHE_NS_WRITES,
+                                (identifier(proc) or "__dynamic__"),
+                                name,
+                            ),
+                            cache_policy.key_func(val),
+                            runnable=proc.bound,
+                            config=config,
+                            runtime=runtime,
+                        )
+                    else:
+                        cache_key = None
                     additional_config = {
                         "metadata": metadata,
                         "tags": proc.tags,
@@ -855,21 +942,6 @@ def prepare_push_task_functional(
         assert task_id == task_id_checksum, f"{task_id} != {task_id_checksum}"
     if for_execution:
         writes: deque[tuple[str, Any]] = deque()
-        cache_policy = call.cache_policy or cache_policy
-        if cache_policy:
-            args_key = cache_policy.key_func(*call.input[0], **call.input[1])
-            cache_key: CacheKey | None = CacheKey(
-                (
-                    CACHE_NS_WRITES,
-                    (identifier(call.func) or "__dynamic__"),
-                ),
-                xxh3_128_hexdigest(
-                    args_key.encode() if isinstance(args_key, str) else args_key,
-                ),
-                cache_policy.ttl,
-            )
-        else:
-            cache_key = None
         scratchpad = _scratchpad(
             configurable.get(CONFIG_KEY_SCRATCHPAD),
             pending_writes,
@@ -890,6 +962,21 @@ def prepare_push_task_functional(
                 run_id=str(rid) if (rid := config.get("run_id")) else None,
             ),
         )
+        cache_policy = call.cache_policy or cache_policy
+        if cache_policy:
+            cache_key: CacheKey | None = _task_cache_key(
+                cache_policy,
+                (
+                    CACHE_NS_WRITES,
+                    (identifier(call.func) or "__dynamic__"),
+                ),
+                cache_policy.key_func(*call.input[0], **call.input[1]),
+                runnable=proc_,
+                config=config,
+                runtime=runtime,
+            )
+        else:
+            cache_key = None
         return PregelExecutableTask(
             name,
             call.input,
@@ -1016,22 +1103,6 @@ def prepare_push_task_send(
         if proc.metadata:
             metadata.update(proc.metadata)
         writes: deque[tuple[str, Any]] = deque()
-        cache_policy = proc.cache_policy or cache_policy
-        if cache_policy:
-            args_key = cache_policy.key_func(packet.arg)
-            cache_key = CacheKey(
-                (
-                    CACHE_NS_WRITES,
-                    (identifier(proc) or "__dynamic__"),
-                    packet.node,
-                ),
-                xxh3_128_hexdigest(
-                    args_key.encode() if isinstance(args_key, str) else args_key,
-                ),
-                cache_policy.ttl,
-            )
-        else:
-            cache_key = None
         scratchpad = _scratchpad(
             config[CONF].get(CONFIG_KEY_SCRATCHPAD),
             pending_writes,
@@ -1053,6 +1124,22 @@ def prepare_push_task_send(
                 run_id=str(rid) if (rid := config.get("run_id")) else None,
             ),
         )
+        cache_policy = proc.cache_policy or cache_policy
+        if cache_policy:
+            cache_key = _task_cache_key(
+                cache_policy,
+                (
+                    CACHE_NS_WRITES,
+                    (identifier(proc) or "__dynamic__"),
+                    packet.node,
+                ),
+                cache_policy.key_func(packet.arg),
+                runnable=proc.bound,
+                config=config,
+                runtime=runtime,
+            )
+        else:
+            cache_key = None
         additional_config: RunnableConfig = {
             "metadata": metadata,
             "tags": proc.tags,
@@ -1164,19 +1251,34 @@ def prepare_node_error_handler_task(
     writes: deque[tuple[str, Any]] = deque()
 
     effective_retry_policy = proc.retry_policy or retry_policy
+    runtime = cast(Runtime, configurable.get(CONFIG_KEY_RUNTIME, DEFAULT_RUNTIME))
+    runtime = runtime.override(
+        store=store, previous=checkpoint["channel_values"].get(PREVIOUS, None)
+    )
     effective_cache_policy = proc.cache_policy or cache_policy
     if effective_cache_policy:
-        args_key = effective_cache_policy.key_func(failed_task.input)
-        cache_key = CacheKey(
+        cache_key = _task_cache_key(
+            effective_cache_policy,
             (
                 CACHE_NS_WRITES,
                 (identifier(proc) or "__dynamic__"),
                 handler_node_name,
             ),
-            xxh3_128_hexdigest(
-                args_key.encode() if isinstance(args_key, str) else args_key
+            effective_cache_policy.key_func(failed_task.input),
+            runnable=proc.bound,
+            config=config,
+            runtime=runtime,
+            extra=(
+                (
+                    "node_error",
+                    (
+                        failed_task.name,
+                        type(failed_error).__module__,
+                        type(failed_error).__qualname__,
+                        repr(failed_error),
+                    ),
+                ),
             ),
-            effective_cache_policy.ttl,
         )
     else:
         cache_key = None
@@ -1189,10 +1291,6 @@ def prepare_node_error_handler_task(
         config[CONF].get(CONFIG_KEY_RESUME_MAP),
         step,
         stop,
-    )
-    runtime = cast(Runtime, configurable.get(CONFIG_KEY_RUNTIME, DEFAULT_RUNTIME))
-    runtime = runtime.override(
-        store=store, previous=checkpoint["channel_values"].get(PREVIOUS, None)
     )
     additional_config: RunnableConfig = {
         "metadata": metadata,
