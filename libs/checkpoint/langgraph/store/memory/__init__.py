@@ -574,18 +574,34 @@ def _compare_values(item_value: Any, filter_value: Any) -> bool:
         return item_value == filter_value
 
 
+def _to_number(value: Any) -> int | float:
+    """Coerce a value for numeric comparison without rounding integers.
+
+    Python compares `int` and `float` exactly, whereas converting an integer
+    above 2**53 to `float` can make it equal to a neighboring integer.
+    """
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            pass
+    return float(value)
+
+
 def _apply_operator(value: Any, operator: str, op_value: Any) -> bool:
     """Apply a comparison operator, matching PostgreSQL's JSONB behavior."""
     if operator == "$eq":
         return value == op_value
     elif operator == "$gt":
-        return float(value) > float(op_value)
+        return _to_number(value) > _to_number(op_value)
     elif operator == "$gte":
-        return float(value) >= float(op_value)
+        return _to_number(value) >= _to_number(op_value)
     elif operator == "$lt":
-        return float(value) < float(op_value)
+        return _to_number(value) < _to_number(op_value)
     elif operator == "$lte":
-        return float(value) <= float(op_value)
+        return _to_number(value) <= _to_number(op_value)
     elif operator == "$ne":
         return value != op_value
     else:
