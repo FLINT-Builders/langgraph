@@ -174,6 +174,9 @@ class AsyncPostgresSaver(BasePostgresSaver):
                             sends["sends"],
                             value["checkpoint"],
                             value["channel_values"],
+                            thread_id=value["thread_id"],
+                            checkpoint_ns=value["checkpoint_ns"],
+                            parent_checkpoint_id=sends["checkpoint_id"],
                         )
             for value in values:
                 yield await self._load_checkpoint_tuple(value)
@@ -225,6 +228,9 @@ class AsyncPostgresSaver(BasePostgresSaver):
                         sends["sends"],
                         value["checkpoint"],
                         value["channel_values"],
+                        thread_id=value["thread_id"],
+                        checkpoint_ns=value["checkpoint_ns"],
+                        parent_checkpoint_id=sends["checkpoint_id"],
                     )
 
             return await self._load_checkpoint_tuple(value)
@@ -493,6 +499,8 @@ class AsyncPostgresSaver(BasePostgresSaver):
             stage2_rows = []
 
         return self._build_delta_channels_writes_history(
+            thread_id=thread_id,
+            checkpoint_ns=checkpoint_ns,
             channels=channels,
             chain_by_ch=chain_by_ch,
             seed_ver_by_ch=seed_ver_by_ch,
@@ -524,7 +532,12 @@ class AsyncPostgresSaver(BasePostgresSaver):
                 **value["checkpoint"],
                 "channel_values": {
                     **(value["checkpoint"].get("channel_values") or {}),
-                    **self._load_blobs(value["channel_values"]),
+                    **self._load_blobs(
+                        value["channel_values"],
+                        value["thread_id"],
+                        value["checkpoint_ns"],
+                        value["checkpoint"]["channel_versions"],
+                    ),
                 },
             },
             value["metadata"],
@@ -539,7 +552,13 @@ class AsyncPostgresSaver(BasePostgresSaver):
                 if value["parent_checkpoint_id"]
                 else None
             ),
-            await asyncio.to_thread(self._load_writes, value["pending_writes"]),
+            await asyncio.to_thread(
+                self._load_writes,
+                value["pending_writes"],
+                value["thread_id"],
+                value["checkpoint_ns"],
+                value["checkpoint_id"],
+            ),
         )
 
     def list(

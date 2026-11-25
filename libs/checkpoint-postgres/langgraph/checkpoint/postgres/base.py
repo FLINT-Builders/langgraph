@@ -15,6 +15,12 @@ from langgraph.checkpoint.base import (
     PendingWrite,
     get_checkpoint_id,
 )
+from langgraph.checkpoint.serde.base import (
+    blob_context,
+    dumps_typed_bound,
+    loads_typed_bound,
+    write_context,
+)
 from langgraph.checkpoint.serde.types import TASKS
 from psycopg.types.json import Jsonb
 
@@ -109,7 +115,7 @@ select
     ) as channel_values,
     (
         select
-        array_agg(array[cw.task_id::text::bytea, cw.channel::bytea, cw.type::bytea, cw.blob] order by cw.task_id, cw.idx)
+        array_agg(array[cw.task_id::text::bytea, cw.channel::bytea, cw.type::bytea, cw.blob, cw.idx::text::bytea] order by cw.task_id, cw.idx)
         from checkpoint_writes cw
         where cw.thread_id = checkpoints.thread_id
             and cw.checkpoint_ns = checkpoints.checkpoint_ns
@@ -120,7 +126,7 @@ from checkpoints """
 SELECT_PENDING_SENDS_SQL = f"""
 select
     checkpoint_id,
-    array_agg(array[type::bytea, blob] order by task_path, task_id, idx) as sends
+    array_agg(array[type::bytea, blob, thread_id::bytea, checkpoint_ns::bytea, task_id::bytea, idx::text::bytea] order by task_path, task_id, idx) as sends
 from checkpoint_writes
 where thread_id = %s
     and checkpoint_id = any(%s)
@@ -354,34 +360,72 @@ class BasePostgresSaver(BaseCheckpointSaver[str]):
 
     def _migrate_pending_sends(
         self,
-        pending_sends: list[tuple[bytes, bytes]],
+        pending_sends: list[tuple[bytes, bytes, bytes, bytes, bytes, bytes]],
         checkpoint: dict[str, Any],
         channel_values: list[tuple[bytes, bytes, bytes]],
+        *,
+        thread_id: str,
+        checkpoint_ns: str,
+        parent_checkpoint_id: str,
     ) -> None:
         if not pending_sends:
             return
-        # add to values
-        enc, blob = self.serde.dumps_typed(
-            [self.serde.loads_typed((c.decode(), b)) for c, b in pending_sends],
-        )
-        channel_values.append((TASKS.encode(), enc.encode(), blob))
+        sends = [
+            loads_typed_bound(
+                self.serde,
+                (c.decode(), b),
+                write_context(
+                    tid.decode(),
+                    ns.decode(),
+                    parent_checkpoint_id,
+                    task_id.decode(),
+                    idx.decode(),
+                    TASKS,
+                ),
+            )
+            for c, b, tid, ns, task_id, idx in pending_sends
+        ]
         # add to versions
-        checkpoint["channel_versions"][TASKS] = (
+        version = (
             max(checkpoint["channel_versions"].values())
             if checkpoint["channel_versions"]
             else self.get_next_version(None, None)
         )
+        checkpoint["channel_versions"][TASKS] = version
+        # add to values
+        enc, blob = dumps_typed_bound(
+            self.serde, sends, blob_context(thread_id, checkpoint_ns, TASKS, version)
+        )
+        channel_values.append((TASKS.encode(), enc.encode(), blob))
 
     def _load_blobs(
-        self, blob_values: list[tuple[bytes, bytes, bytes]]
+        self,
+        blob_values: list[tuple[bytes, bytes, bytes]],
+        thread_id: str,
+        checkpoint_ns: str,
+        channel_versions: Mapping[str, Any] | None,
     ) -> dict[str, Any]:
+        """Load joined `checkpoint_blobs` rows.
+
+        `channel_versions` is the checkpoint's version map the rows were joined
+        on, or `None` when blobs are keyed by channel alone.
+        """
         if not blob_values:
             return {}
-        return {
-            k.decode(): self.serde.loads_typed((t.decode(), v))
-            for k, t, v in blob_values
-            if t.decode() != "empty"
-        }
+        result: dict[str, Any] = {}
+        for k, t, v in blob_values:
+            if t.decode() == "empty":
+                continue
+            channel = k.decode()
+            version = (
+                channel_versions.get(channel) if channel_versions is not None else None
+            )
+            result[channel] = loads_typed_bound(
+                self.serde,
+                (t.decode(), v),
+                blob_context(thread_id, checkpoint_ns, channel, version),
+            )
+        return result
 
     @staticmethod
     def _ingest_stage1_page(
@@ -471,6 +515,8 @@ class BasePostgresSaver(BaseCheckpointSaver[str]):
     def _build_delta_channels_writes_history(
         self,
         *,
+        thread_id: str,
+        checkpoint_ns: str,
         channels: Sequence[str],
         chain_by_ch: Mapping[str, list[str]],
         seed_ver_by_ch: Mapping[str, str | None],
@@ -529,8 +575,12 @@ class BasePostgresSaver(BaseCheckpointSaver[str]):
             collected: list[PendingWrite] = []
             cid_writes = writes_by_ch_by_cid.get(ch, {})
             for cid in chain_cids:
-                for type_tag, write_blob, task_id, _idx in cid_writes.get(cid, []):
-                    val = self.serde.loads_typed((type_tag, write_blob))
+                for type_tag, write_blob, task_id, idx in cid_writes.get(cid, []):
+                    val = loads_typed_bound(
+                        self.serde,
+                        (type_tag, write_blob),
+                        write_context(thread_id, checkpoint_ns, cid, task_id, idx, ch),
+                    )
                     collected.append((task_id, ch, val))
             collected.reverse()
 
@@ -538,7 +588,11 @@ class BasePostgresSaver(BaseCheckpointSaver[str]):
             if seed_version is not None:
                 blob = seed_blob_by_ver.get((ch, seed_version))
                 if blob is not None and blob[0] != "empty":
-                    entry["seed"] = self.serde.loads_typed(blob)
+                    entry["seed"] = loads_typed_bound(
+                        self.serde,
+                        blob,
+                        blob_context(thread_id, checkpoint_ns, ch, seed_version),
+                    )
                 elif ch in seed_inline_by_ch:
                     # Inline primitive: stored in the checkpoint, not the blobs
                     # table, so stage 2 never returned a row for it.
@@ -563,7 +617,11 @@ class BasePostgresSaver(BaseCheckpointSaver[str]):
                 k,
                 cast(str, ver),
                 *(
-                    self.serde.dumps_typed(values[k])
+                    dumps_typed_bound(
+                        self.serde,
+                        values[k],
+                        blob_context(thread_id, checkpoint_ns, k, ver),
+                    )
                     if k in values
                     else ("empty", None)
                 ),
@@ -572,16 +630,31 @@ class BasePostgresSaver(BaseCheckpointSaver[str]):
         ]
 
     def _load_writes(
-        self, writes: list[tuple[bytes, bytes, bytes, bytes]]
+        self,
+        writes: list[tuple[bytes, bytes, bytes, bytes, bytes]],
+        thread_id: str,
+        checkpoint_ns: str,
+        checkpoint_id: str,
     ) -> list[tuple[str, str, Any]]:
         return (
             [
                 (
                     tid.decode(),
                     channel.decode(),
-                    self.serde.loads_typed((t.decode(), v)),
+                    loads_typed_bound(
+                        self.serde,
+                        (t.decode(), v),
+                        write_context(
+                            thread_id,
+                            checkpoint_ns,
+                            checkpoint_id,
+                            tid.decode(),
+                            idx.decode(),
+                            channel.decode(),
+                        ),
+                    ),
                 )
-                for tid, channel, t, v in writes
+                for tid, channel, t, v, idx in writes
             ]
             if writes
             else []
@@ -605,7 +678,18 @@ class BasePostgresSaver(BaseCheckpointSaver[str]):
                 task_path,
                 WRITES_IDX_MAP.get(channel, idx),
                 channel,
-                *self.serde.dumps_typed(value),
+                *dumps_typed_bound(
+                    self.serde,
+                    value,
+                    write_context(
+                        thread_id,
+                        checkpoint_ns,
+                        checkpoint_id,
+                        task_id,
+                        WRITES_IDX_MAP.get(channel, idx),
+                        channel,
+                    ),
+                ),
             )
             for idx, (channel, value) in enumerate(writes)
         ]
