@@ -70,7 +70,7 @@ from langgraph.channels.untracked_value import UntrackedValue
 from langgraph.constants import TAG_HIDDEN
 from langgraph.errors import NodeError
 from langgraph.managed.base import ManagedValueMapping
-from langgraph.pregel._call import get_runnable_for_task, identifier
+from langgraph.pregel._call import cache_identifier, get_runnable_for_task
 from langgraph.pregel._io import read_channels
 from langgraph.pregel._log import logger
 from langgraph.pregel._read import INPUT_CACHE_KEY_TYPE, PregelNode
@@ -671,7 +671,7 @@ def prepare_single_task(
                         cache_key = CacheKey(
                             (
                                 CACHE_NS_WRITES,
-                                (identifier(proc) or "__dynamic__"),
+                                cache_identifier(proc),
                                 name,
                             ),
                             xxh3_128_hexdigest(
@@ -861,7 +861,7 @@ def prepare_push_task_functional(
             cache_key: CacheKey | None = CacheKey(
                 (
                     CACHE_NS_WRITES,
-                    (identifier(call.func) or "__dynamic__"),
+                    cache_identifier(call.func),
                 ),
                 xxh3_128_hexdigest(
                     args_key.encode() if isinstance(args_key, str) else args_key,
@@ -1022,7 +1022,7 @@ def prepare_push_task_send(
             cache_key = CacheKey(
                 (
                     CACHE_NS_WRITES,
-                    (identifier(proc) or "__dynamic__"),
+                    cache_identifier(proc),
                     packet.node,
                 ),
                 xxh3_128_hexdigest(
@@ -1170,7 +1170,7 @@ def prepare_node_error_handler_task(
         cache_key = CacheKey(
             (
                 CACHE_NS_WRITES,
-                (identifier(proc) or "__dynamic__"),
+                cache_identifier(proc),
                 handler_node_name,
             ),
             xxh3_128_hexdigest(

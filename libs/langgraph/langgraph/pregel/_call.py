@@ -6,7 +6,10 @@ import concurrent.futures
 import functools
 import inspect
 import sys
+import threading
 import types
+import uuid
+import weakref
 from collections.abc import Awaitable, Callable, Generator, Sequence
 from datetime import timedelta
 from typing import Any, Generic, TypeVar, cast
@@ -81,8 +84,7 @@ def _whichmodule(obj: Any, name: str) -> str | None:
     return None
 
 
-def identifier(obj: Any, name: str | None = None) -> str | None:
-    """Return the module and name of an object."""
+def _unwrap_callable(obj: Any) -> Any:
     from langgraph._internal._runnable import RunnableCallable, RunnableSeq
     from langgraph.pregel._read import PregelNode
 
@@ -91,7 +93,13 @@ def identifier(obj: Any, name: str | None = None) -> str | None:
     if isinstance(obj, RunnableSeq):
         obj = obj.steps[0]
     if isinstance(obj, RunnableCallable):
-        obj = obj.func
+        obj = obj.func if obj.func is not None else obj.afunc
+    return obj
+
+
+def identifier(obj: Any, name: str | None = None) -> str | None:
+    """Return the module and name of an object."""
+    obj = _unwrap_callable(obj)
     if name is None:
         name = getattr(obj, "__qualname__", None)
     if name is None:  # pragma: no cover
@@ -108,6 +116,84 @@ def identifier(obj: Any, name: str | None = None) -> str | None:
         return None
 
     return f"{module_name}.{name}"
+
+
+# Maps `id(obj)` to `(ref, token)`. `ref()` returns the object the token was
+# issued to, so a reused `id` is detected rather than inheriting the token.
+_CACHE_TOKENS: dict[int, tuple[Callable[[], Any], str]] = {}
+# Re-entrant: weakref callbacks can fire during GC while the lock is held.
+_CACHE_TOKENS_LOCK = threading.RLock()
+_MAX_WRAPPED_DEPTH = 32
+
+
+def _drop_cache_token(key: int, ref: Any) -> None:
+    with _CACHE_TOKENS_LOCK:
+        entry = _CACHE_TOKENS.get(key)
+        if entry is not None and entry[0] is ref:
+            del _CACHE_TOKENS[key]
+
+
+def _cache_token(obj: Any) -> str:
+    key = id(obj)
+    with _CACHE_TOKENS_LOCK:
+        entry = _CACHE_TOKENS.get(key)
+        if entry is not None and entry[0]() is obj:
+            return entry[1]
+        ref: Callable[[], Any]
+        try:
+            ref = weakref.ref(obj, functools.partial(_drop_cache_token, key))
+        except TypeError:
+            # Not weak-referenceable: hold a strong reference so the `id` is
+            # never reused by another object.
+            def ref() -> Any:
+                return obj
+
+        token = uuid.uuid4().hex
+        _CACHE_TOKENS[key] = (ref, token)
+        return token
+
+
+def _resolves_to(obj: Any) -> bool:
+    """Whether `obj.__module__` + `obj.__qualname__` resolves to `obj` itself.
+
+    Wrappers created with `functools.update_wrapper` (such as `@task`) are
+    followed through `__wrapped__`.
+    """
+    module_name = getattr(obj, "__module__", None)
+    qualname = getattr(obj, "__qualname__", None)
+    if not isinstance(module_name, str) or not isinstance(qualname, str):
+        return False
+    module = sys.modules.get(module_name)
+    if module is None:
+        return False
+    try:
+        target, _ = _getattribute(module, qualname)
+        for _ in range(_MAX_WRAPPED_DEPTH):
+            if target is obj:
+                return True
+            target = getattr(target, "__wrapped__", None)
+            if target is None:
+                return False
+    except Exception:
+        return False
+    return False
+
+
+def cache_identifier(obj: Any) -> str:
+    """Return the identity of a callable used to namespace its cache entries.
+
+    Two distinct callables must never share an identity, otherwise one is
+    served the other's cached writes. `module.qualname` is only used when it
+    resolves to this exact object, which keeps the identity stable across
+    processes for module- and class-level functions. Any other callable
+    (lambdas, nested or factory-built functions, bound methods, partials,
+    callable instances, runnables) gets a random token bound to that object.
+    """
+    obj = _unwrap_callable(obj)
+    ident = identifier(obj)
+    if ident is not None and _resolves_to(obj):
+        return ident
+    return f"{ident or '__dynamic__'}#{_cache_token(obj)}"
 
 
 def _lookup_module_and_qualname(
