@@ -7,7 +7,12 @@ import threading
 from collections.abc import Mapping, Sequence
 
 from langgraph.cache.base import BaseCache, FullKey, Namespace, ValueT
-from langgraph.checkpoint.serde.base import SerializerProtocol
+from langgraph.checkpoint.serde.base import (
+    SerializerProtocol,
+    cache_context,
+    dumps_typed_bound,
+    loads_typed_bound,
+)
 
 
 class SqliteCache(BaseCache[ValueT]):
@@ -66,8 +71,8 @@ class SqliteCache(BaseCache[ValueT]):
                         "DELETE FROM cache WHERE (ns, key) = (?, ?)", (ns, key)
                     )
                     continue
-                values[(tuple(ns.split(",")), key)] = self.serde.loads_typed(
-                    (encoding, raw)
+                values[(tuple(ns.split(",")), key)] = loads_typed_bound(
+                    self.serde, (encoding, raw), cache_context(ns, key)
                 )
             return values
 
@@ -85,10 +90,13 @@ class SqliteCache(BaseCache[ValueT]):
                     expiry: float | None = (now + delta).timestamp()
                 else:
                     expiry = None
-                encoding, raw = self.serde.dumps_typed(value)
+                ns = ",".join(key[0])
+                encoding, raw = dumps_typed_bound(
+                    self.serde, value, cache_context(ns, key[1])
+                )
                 self._conn.execute(
                     "INSERT OR REPLACE INTO cache (ns, key, expiry, encoding, val) VALUES (?, ?, ?, ?, ?)",
-                    (",".join(key[0]), key[1], expiry, encoding, raw),
+                    (ns, key[1], expiry, encoding, raw),
                 )
 
     async def aset(self, mapping: Mapping[FullKey, tuple[ValueT, int | None]]) -> None:

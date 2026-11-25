@@ -14,7 +14,13 @@ from langgraph.checkpoint.base import (
     CheckpointTuple,
     get_serializable_checkpoint_metadata,
 )
-from langgraph.checkpoint.serde.base import SerializerProtocol
+from langgraph.checkpoint.serde.base import (
+    SerializerProtocol,
+    blob_context,
+    dumps_typed_bound,
+    loads_typed_bound,
+    write_context,
+)
 from langgraph.checkpoint.serde.types import TASKS
 from psycopg import (
     AsyncConnection,
@@ -97,14 +103,14 @@ select
     ) as channel_values,
     (
         select
-        array_agg(array[cw.task_id::text::bytea, cw.channel::bytea, cw.type::bytea, cw.blob] order by cw.task_id, cw.idx)
+        array_agg(array[cw.task_id::text::bytea, cw.channel::bytea, cw.type::bytea, cw.blob, cw.idx::text::bytea] order by cw.task_id, cw.idx)
         from checkpoint_writes cw
         where cw.thread_id = checkpoints.thread_id
             and cw.checkpoint_ns = checkpoints.checkpoint_ns
             and cw.checkpoint_id = (checkpoint->>'id')
     ) as pending_writes,
     (
-        select array_agg(array[cw.type::bytea, cw.blob] order by cw.task_path, cw.task_id, cw.idx)
+        select array_agg(array[cw.type::bytea, cw.blob, cw.checkpoint_id::bytea, cw.task_id::bytea, cw.idx::text::bytea] order by cw.task_path, cw.task_id, cw.idx)
         from checkpoint_writes cw
         where cw.thread_id = checkpoints.thread_id
             and cw.checkpoint_ns = checkpoints.checkpoint_ns
@@ -160,9 +166,35 @@ def _dump_blobs(
             thread_id,
             checkpoint_ns,
             k,
-            *(serde.dumps_typed(values[k]) if k in values else ("empty", None)),
+            *(
+                dumps_typed_bound(
+                    serde, values[k], blob_context(thread_id, checkpoint_ns, k, None)
+                )
+                if k in values
+                else ("empty", None)
+            ),
         )
         for k in versions
+    ]
+
+
+def _load_pending_sends(serde: SerializerProtocol, value: DictRow) -> list[Any]:
+    if not value["pending_sends"]:
+        return []
+    return [
+        loads_typed_bound(
+            serde,
+            (t.decode(), v),
+            write_context(
+                value["thread_id"],
+                value["checkpoint_ns"],
+                checkpoint_id.decode(),
+                task_id.decode(),
+                idx.decode(),
+                TASKS,
+            ),
+        )
+        for t, v, checkpoint_id, task_id, idx in value["pending_sends"]
     ]
 
 
@@ -281,13 +313,13 @@ class ShallowPostgresSaver(BasePostgresSaver):
             for value in cur:
                 checkpoint: Checkpoint = {
                     **value["checkpoint"],
-                    "channel_values": self._load_blobs(value["channel_values"]),
-                    "pending_sends": [
-                        self.serde.loads_typed((t.decode(), v))
-                        for t, v in value["pending_sends"]
-                    ]
-                    if value["pending_sends"]
-                    else [],
+                    "channel_values": self._load_blobs(
+                        value["channel_values"],
+                        value["thread_id"],
+                        value["checkpoint_ns"],
+                        None,
+                    ),
+                    "pending_sends": _load_pending_sends(self.serde, value),
                 }
                 yield CheckpointTuple(
                     config={
@@ -299,7 +331,12 @@ class ShallowPostgresSaver(BasePostgresSaver):
                     },
                     checkpoint=checkpoint,
                     metadata=value["metadata"],
-                    pending_writes=self._load_writes(value["pending_writes"]),
+                    pending_writes=self._load_writes(
+                        value["pending_writes"],
+                        value["thread_id"],
+                        value["checkpoint_ns"],
+                        checkpoint["id"],
+                    ),
                 )
 
     def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
@@ -350,13 +387,13 @@ class ShallowPostgresSaver(BasePostgresSaver):
             for value in cur:
                 checkpoint: Checkpoint = {
                     **value["checkpoint"],
-                    "channel_values": self._load_blobs(value["channel_values"]),
-                    "pending_sends": [
-                        self.serde.loads_typed((t.decode(), v))
-                        for t, v in value["pending_sends"]
-                    ]
-                    if value["pending_sends"]
-                    else [],
+                    "channel_values": self._load_blobs(
+                        value["channel_values"],
+                        value["thread_id"],
+                        value["checkpoint_ns"],
+                        None,
+                    ),
+                    "pending_sends": _load_pending_sends(self.serde, value),
                 }
                 return CheckpointTuple(
                     config={
@@ -368,7 +405,12 @@ class ShallowPostgresSaver(BasePostgresSaver):
                     },
                     checkpoint=checkpoint,
                     metadata=value["metadata"],
-                    pending_writes=self._load_writes(value["pending_writes"]),
+                    pending_writes=self._load_writes(
+                        value["pending_writes"],
+                        value["thread_id"],
+                        value["checkpoint_ns"],
+                        checkpoint["id"],
+                    ),
                 )
 
     def put(
@@ -647,13 +689,13 @@ class AsyncShallowPostgresSaver(BasePostgresSaver):
             async for value in cur:
                 checkpoint: Checkpoint = {
                     **value["checkpoint"],
-                    "channel_values": self._load_blobs(value["channel_values"]),
-                    "pending_sends": [
-                        self.serde.loads_typed((t.decode(), v))
-                        for t, v in value["pending_sends"]
-                    ]
-                    if value["pending_sends"]
-                    else [],
+                    "channel_values": self._load_blobs(
+                        value["channel_values"],
+                        value["thread_id"],
+                        value["checkpoint_ns"],
+                        None,
+                    ),
+                    "pending_sends": _load_pending_sends(self.serde, value),
                 }
                 yield CheckpointTuple(
                     config={
@@ -666,7 +708,11 @@ class AsyncShallowPostgresSaver(BasePostgresSaver):
                     checkpoint=checkpoint,
                     metadata=value["metadata"],
                     pending_writes=await asyncio.to_thread(
-                        self._load_writes, value["pending_writes"]
+                        self._load_writes,
+                        value["pending_writes"],
+                        value["thread_id"],
+                        value["checkpoint_ns"],
+                        checkpoint["id"],
                     ),
                 )
 
@@ -697,13 +743,13 @@ class AsyncShallowPostgresSaver(BasePostgresSaver):
             async for value in cur:
                 checkpoint: Checkpoint = {
                     **value["checkpoint"],
-                    "channel_values": self._load_blobs(value["channel_values"]),
-                    "pending_sends": [
-                        self.serde.loads_typed((t.decode(), v))
-                        for t, v in value["pending_sends"]
-                    ]
-                    if value["pending_sends"]
-                    else [],
+                    "channel_values": self._load_blobs(
+                        value["channel_values"],
+                        value["thread_id"],
+                        value["checkpoint_ns"],
+                        None,
+                    ),
+                    "pending_sends": _load_pending_sends(self.serde, value),
                 }
                 return CheckpointTuple(
                     config={
@@ -716,7 +762,11 @@ class AsyncShallowPostgresSaver(BasePostgresSaver):
                     checkpoint=checkpoint,
                     metadata=value["metadata"],
                     pending_writes=await asyncio.to_thread(
-                        self._load_writes, value["pending_writes"]
+                        self._load_writes,
+                        value["pending_writes"],
+                        value["thread_id"],
+                        value["checkpoint_ns"],
+                        checkpoint["id"],
                     ),
                 )
 

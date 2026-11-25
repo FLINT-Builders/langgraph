@@ -734,7 +734,11 @@ def _with_msgpack_allowlist(
             updated_inner = inner.with_msgpack_allowlist(extra_allowlist)
             if updated_inner is inner:
                 return serde
-            return EncryptedSerializer(serde.cipher, updated_inner)
+            return EncryptedSerializer(
+                serde.cipher,
+                updated_inner,
+                allow_unbound_ciphertext=serde.allow_unbound_ciphertext,
+            )
     logger.warning(
         "Serializer %s does not support msgpack allowlist. "
         "Strict msgpack deserialization will not be enforced.",
